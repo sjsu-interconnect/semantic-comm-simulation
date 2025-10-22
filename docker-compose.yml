@@ -1,25 +1,27 @@
-version: '3.8'
-
 services:
-  receiver:
-    build: ./receiver
-    networks:
-      - semantic-net
-
-  channel:
-    build: ./channel
-    networks:
-      - semantic-net
-    depends_on:
-      - receiver
-
   sender:
     build: ./sender
-    networks:
-      - semantic-net
-    depends_on:
-      - channel
+    volumes:
+      - ./images:/app/images:ro
+    expose:
+      - "65500"  # <-- ADD THIS LINE
+    # ... other sender config ...
 
-networks:
-  semantic-net:
-    driver: bridge
+  receiver:
+    build: ./receiver
+    volumes:
+      - ./images:/app/images:ro
+    ports:
+      - "65432:65432" # This is fine if you want to see receiver output
+    depends_on:
+      - sender
+      - channel
+    # ... other receiver config ...
+    
+  channel:
+    build: ./channel
+    ports:
+      - "65431:65431"
+    depends_on:
+      - sender
+    # ... other channel config ..
