@@ -7,189 +7,268 @@ import os
 import numpy as np
 import time
 import io
-import pickle  # --- NEW: Import pickle ---
+import pickle
+import logging
+from typing import Dict, Any, Optional
 
-# --- CONFIGURATION ---
-HOST = '0.0.0.0'
-PORT = 65432
-IMAGE_DIR = '/app/images'
-CLASSES = ['cat', 'car', 'dog']
+# --- Setup basic logging ---
+logging.basicConfig(level=logging.INFO,
+                    format='[%(asctime)s] [Receiver] %(message)s',
+                    datefmt='%Y-%m-%d %H:%M:%S')
 
-# --- FEEDBACK CONFIG ---
-SENDER_HOST = 'sender'
-SENDER_FEEDBACK_PORT = 65500
-LATENCY_DEADLINE_TAU = 1.0
-ALPHA_WEIGHT = 0.5
+# --- Configuration Constants ---
+DEFAULT_HOST = '0.0.0.0'
+DEFAULT_PORT = 65432
+DEFAULT_IMAGE_DIR = '/app/images'
+DEFAULT_CLASSES = ['cat', 'car', 'dog']
+DEFAULT_SENDER_HOST = 'sender'
+DEFAULT_SENDER_FEEDBACK_PORT = 65500
+DEFAULT_LATENCY_DEADLINE_TAU = 1.0
+DEFAULT_ALPHA_WEIGHT = 0.5
 
-# --- MODEL SETUP ---
-weights = ResNet18_Weights.DEFAULT
-model = resnet18(weights=weights)
-feature_extractor = torch.nn.Sequential(*list(model.children())[:-1])
-feature_extractor.eval()
-preprocess = weights.transforms()
 
-# --- FEEDBACK HELPERS ---
-def calculate_semantic_loss(ground_truth_vec, noisy_vec):
-    if ground_truth_vec is None or noisy_vec is None: return 1.0
-    return np.mean((ground_truth_vec - noisy_vec)**2)
-
-def calculate_reward(semantic_loss, latency, deadline):
-    latency_met = 1.0 if latency <= deadline else 0.0
-    latency_penalty = 1.0 - latency_met
-    cost = latency_penalty + ALPHA_WEIGHT * semantic_loss
-    return -cost
-
-def send_feedback(reward, noise, bandwidth):
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as feedback_sock:
-            feedback_sock.connect((SENDER_HOST, SENDER_FEEDBACK_PORT))
-            feedback_payload = np.array([reward, noise, bandwidth], dtype=np.float32)
-            feedback_sock.sendall(feedback_payload.tobytes())
-    except Exception as e:
-        print(f"❌ Error sending feedback to sender: {e}")
-
-# --- Refactored vector extraction ---
-def get_vector_from_image(img):
-    img_t = preprocess(img)
-    batch_t = torch.unsqueeze(img_t, 0)
-    with torch.no_grad():
-        features = feature_extractor(batch_t)
-        return features.squeeze().numpy()
-
-def get_image_feature_vector(image_path):
-    img = Image.open(image_path).convert('RGB')
-    return get_vector_from_image(img)
-
-# --- ORIGINAL FUNCTIONS ---
-def create_knowledge_base():
-    print("Creating receiver's knowledge base...")
-    knowledge_base = {}
-    for class_name in CLASSES:
-        image_path = f"{IMAGE_DIR}/{class_name}.jpeg"
-        if not os.path.exists(image_path):
-            print(f"Warning: Image file not found {image_path}. Skipping.")
-            continue
-        knowledge_base[class_name] = get_image_feature_vector(image_path)
-        print(f" - Generated vector for '{class_name}'")
-    return knowledge_base
-
-def cosine_similarity(vec1, vec2):
-    if vec1 is None or vec2 is None: return -1
-    norm1 = np.linalg.norm(vec1)
-    norm2 = np.linalg.norm(vec2)
-    if norm1 == 0 or norm2 == 0: return 0
-    return np.dot(vec1, vec2) / (norm1 * norm2)
-
-def decode_semantic_meaning(noisy_vector, knowledge_base):
-    max_similarity = -1
-    best_match = "UNKNOWN"
-    for class_name, ideal_vector in knowledge_base.items():
-        similarity = cosine_similarity(noisy_vector, ideal_vector)
-        if similarity > max_similarity:
-            max_similarity = similarity
-            best_match = class_name
-    return best_match, similarity
-
-# --- MAIN RECEIVER LOOP ---
-knowledge_base = create_knowledge_base()
-
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-    s.bind((HOST, PORT))
-    s.listen()
-    print("\nReceiver is listening for connections...")
+class Receiver:
+    """
+    Acts as the receiver in the semantic communication loop.
     
-    while True:
-        conn, addr = s.accept()
-        with conn:
-            print(f"\nConnected by {addr}")
-            
-            buffer = b""
-            while True:
-                chunk = conn.recv(4096)
-                if not chunk:
-                    break
-                buffer += chunk
-            data = buffer
+    It listens for messages from the channel, decodes them, calculates
+    performance (latency, semantic loss), and sends a feedback package
+    (reward, net_state) back to the sender.
+    """
 
+    def __init__(self, host: str, port: int, image_dir: str, classes: list,
+                 sender_host: str, feedback_port: int, deadline: float, alpha: float):
+        
+        # --- Configuration ---
+        self.host = host
+        self.port = port
+        self.image_dir = image_dir
+        self.classes = classes
+        self.sender_host = sender_host
+        self.feedback_port = feedback_port
+        self.deadline_tau = deadline
+        self.alpha_weight = alpha
+
+        # --- Model Initialization ---
+        logging.info("Initializing ResNet-18 feature extractor...")
+        self.weights = ResNet18_Weights.DEFAULT
+        self.model = resnet18(weights=self.weights)
+        self.feature_extractor = torch.nn.Sequential(*list(self.model.children())[:-1])
+        self.feature_extractor.eval()
+        self.preprocess = self.weights.transforms()
+        
+        # --- Knowledge Base Initialization ---
+        self.knowledge_base = self._create_knowledge_base()
+
+    def _get_vector_from_image(self, img: Image.Image) -> np.ndarray:
+        """Extracts a feature vector from a PIL Image object."""
+        img_t = self.preprocess(img)
+        batch_t = torch.unsqueeze(img_t, 0)
+        with torch.no_grad():
+            features = self.feature_extractor(batch_t)
+            return features.squeeze().numpy()
+
+    def _get_image_feature_vector(self, image_path: str) -> np.ndarray:
+        """Utility function to extract feature vector from a file path."""
+        img = Image.open(image_path).convert('RGB')
+        return self._get_vector_from_image(img)
+
+    def _create_knowledge_base(self) -> Dict[str, np.ndarray]:
+        """
+        Generates the ideal feature vector for each known class and stores it.
+        This is the receiver's semantic "ground truth".
+        """
+        logging.info("Creating receiver's knowledge base...")
+        knowledge_base = {}
+        for class_name in self.classes:
+            image_path = f"{self.image_dir}/{class_name}.jpeg"
+            if not os.path.exists(image_path):
+                logging.warning(f"Image file not found {image_path}. Skipping.")
+                continue
+            knowledge_base[class_name] = self._get_image_feature_vector(image_path)
+            logging.info(f" - Generated vector for '{class_name}'")
+        return knowledge_base
+
+    def _calculate_semantic_loss(self, ground_truth_vec: Optional[np.ndarray],
+                                 reconstructed_vec: Optional[np.ndarray]) -> float:
+        """Calculates Mean Squared Error (MSE) between two vectors."""
+        if ground_truth_vec is None or reconstructed_vec is None:
+            return 1.0  # Max penalty
+        return np.mean((ground_truth_vec - reconstructed_vec)**2)
+
+    def _calculate_reward(self, semantic_loss: float, latency: float) -> float:
+        """Calculates the reward based on loss and latency."""
+        latency_met = 1.0 if latency <= self.deadline_tau else 0.0
+        latency_penalty = 1.0 - latency_met
+        cost = latency_penalty + self.alpha_weight * semantic_loss
+        return -cost
+
+    def _send_feedback(self, reward: float, noise: float, bandwidth: float):
+        """Sends the calculated reward and observed network state back to the sender."""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as feedback_sock:
+                feedback_sock.connect((self.sender_host, self.feedback_port))
+                feedback_payload = np.array([reward, noise, bandwidth], dtype=np.float32)
+                feedback_sock.sendall(feedback_payload.tobytes())
+        except socket.error as e:
+            logging.error(f"Error sending feedback to sender: {e}")
+
+    def _cosine_similarity(self, vec1: np.ndarray, vec2: np.ndarray) -> float:
+        """Calculates cosine similarity, handling potential None values."""
+        if vec1 is None or vec2 is None:
+            return -1.0
+        norm1 = np.linalg.norm(vec1)
+        norm2 = np.linalg.norm(vec2)
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+        return np.dot(vec1, vec2) / (norm1 * norm2)
+
+    def _decode_semantic_meaning(self, reconstructed_vector: np.ndarray) -> (str, float):
+        """Finds the best match for the vector from the knowledge base."""
+        max_similarity = -1.0
+        best_match = "UNKNOWN"
+        for class_name, ideal_vector in self.knowledge_base.items():
+            similarity = self._cosine_similarity(reconstructed_vector, ideal_vector)
+            if similarity > max_similarity:
+                max_similarity = similarity
+                best_match = class_name
+        return best_match, max_similarity
+
+    def _receive_full_message(self, conn: socket.socket) -> bytes:
+        """Reads all data from a single connection until it closes."""
+        buffer = b""
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            buffer += chunk
+        return buffer
+
+    def _process_message(self, data: bytes):
+        """
+        The core business logic to unpack, decode, and handle a received message.
+        """
+        reconstructed_vector = None
+        original_label = None
+        send_timestamp = None
+        log_msg_type = "UNKNOWN"
+        observed_noise = -1.0
+        observed_bandwidth = -1.0
+
+        try:
+            # --- 1. Unpack Network State from Payload ---
+            # FORMAT: noise | bandwidth | pickled_payload
+            noise_bytes, rest_of_data = data.split(b'|', 1)
+            bw_bytes, pickled_payload = rest_of_data.split(b'|', 1)
+
+            observed_noise = np.frombuffer(noise_bytes, dtype=np.float32)[0]
+            observed_bandwidth = np.frombuffer(bw_bytes, dtype=np.float32)[0]
+
+            # --- 2. Unpack the main message dictionary ---
+            message_dict: Dict[str, Any] = pickle.loads(pickled_payload)
+            
+            send_timestamp = message_dict['ts']
+            original_label = message_dict['label']
+            msg_type = message_dict['type']
+            payload = message_dict['payload']
+
+            # --- 3. Decode payload based on type ---
+            if msg_type == "SEM":
+                log_msg_type = "SEMANTIC"
+                reconstructed_vector = payload  # Payload is the noisy numpy vector
+
+            elif msg_type == "RAW":
+                log_msg_type = "RAW"
+                img_stream = io.BytesIO(payload)  # Payload is the raw image bytes
+                img = Image.open(img_stream).convert('RGB')
+                reconstructed_vector = self._get_vector_from_image(img)
+
+            else:
+                logging.warning(f"Error: Unknown message type '{msg_type}'. Skipping.")
+                return
+
+        except Exception as e:
+            logging.error(f"Error unpacking data: {e}. Buffer size: {len(data)}. Skipping packet.")
+            return
+
+        # --- 4. Performance Calculation ---
+        reception_timestamp = time.time()
+        total_latency = reception_timestamp - send_timestamp
+
+        ground_truth_vector = self.knowledge_base.get(original_label)
+        
+        if (ground_truth_vector is not None and 
+            reconstructed_vector is not None and
+            ground_truth_vector.shape != reconstructed_vector.shape):
+            
+            logging.warning(f"Shape mismatch! GT: {ground_truth_vector.shape}, Rec: {reconstructed_vector.shape}")
+            semantic_loss = 1.0 # Max penalty
+        else:
+            semantic_loss = self._calculate_semantic_loss(ground_truth_vector, reconstructed_vector)
+
+        reward = self._calculate_reward(semantic_loss, total_latency)
+
+        # --- 5. Send Feedback ---
+        self._send_feedback(reward, observed_noise, observed_bandwidth)
+
+        # --- 6. Logging ---
+        decoded_label, similarity = self._decode_semantic_meaning(reconstructed_vector)
+        
+        logging.info(f"Received {log_msg_type} for: {original_label}")
+        logging.info(f"-> Decoded Meaning: **{decoded_label}** (Similarity: {similarity:.4f})")
+        logging.info(f"Latency: {total_latency:.4f}s")
+        logging.info(f"Semantic Loss (MSE): {semantic_loss:.4f}")
+        logging.info(f"Network State: (Noise: {observed_noise:.3f}, BW: {observed_bandwidth:.2f})")
+        logging.info(f"Calculated Reward: {reward:.4f}")
+
+        if original_label == decoded_label:
+            logging.info("✅ SUCCESS: Meaning was recovered.")
+        else:
+            logging.info("❌ FAILURE: Meaning was lost.")
+
+    def handle_client(self, conn: socket.socket, addr):
+        """Manages a single connection from the channel."""
+        logging.info(f"Connected by {addr}")
+        try:
+            data = self._receive_full_message(conn)
             if not data:
-                print("Received an empty message. Skipping.")
-                continue
-
-            reconstructed_vector = None
-            original_label = None
-            send_timestamp = None
-            log_msg_type = "UNKNOWN"
-            observed_noise = -1.0
-            observed_bandwidth = -1.0
-
-            try:
-                # --- NEW: Unpack network state from pickled payload ---
-                # FORMAT: noise | bandwidth | pickled_payload
-                noise_bytes, rest_of_data = data.split(b'|', 1)
-                bw_bytes, pickled_payload = rest_of_data.split(b'|', 1)
-
-                # Unpack network state
-                observed_noise = np.frombuffer(noise_bytes, dtype=np.float32)[0]
-                observed_bandwidth = np.frombuffer(bw_bytes, dtype=np.float32)[0]
-
-                # Unpack the main message dict
-                message_dict = pickle.loads(pickled_payload)
-                
-                send_timestamp = message_dict['ts']
-                original_label = message_dict['label']
-                msg_type = message_dict['type']
-                payload = message_dict['payload']
-
-                if msg_type == "SEM":
-                    log_msg_type = "SEMANTIC"
-                    # Payload is the noisy numpy vector
-                    reconstructed_vector = payload
-
-                elif msg_type == "RAW":
-                    log_msg_type = "RAW"
-                    # Payload is the raw image file bytes
-                    img_stream = io.BytesIO(payload)
-                    img = Image.open(img_stream).convert('RGB')
-                    reconstructed_vector = get_vector_from_image(img)
-
-                else:
-                    print(f"Error: Unknown message type '{msg_type}'. Skipping.")
-                    continue
-            
-            except Exception as e:
-                print(f"Error unpacking data: {e}. Buffer size: {len(data)}. Skipping packet.")
-                continue
-
-            # --- Performance Calculation ---
-            reception_timestamp = time.time()
-            total_latency = reception_timestamp - send_timestamp
-
-            ground_truth_vector = knowledge_base.get(original_label)
-            
-            if (ground_truth_vector is not None and 
-                reconstructed_vector is not None and
-                ground_truth_vector.shape != reconstructed_vector.shape):
-                
-                print(f"Shape mismatch! Ground Truth: {ground_truth_vector.shape}, Reconstructed: {reconstructed_vector.shape}")
-                semantic_loss = 1.0 # Max penalty
+                logging.info(f"Received an empty message from {addr}. Skipping.")
             else:
-                semantic_loss = calculate_semantic_loss(ground_truth_vector, reconstructed_vector)
+                self._process_message(data)
+        except Exception as e:
+            logging.error(f"Error handling client {addr}: {e}")
+        finally:
+            conn.close()
 
-            reward = calculate_reward(semantic_loss, total_latency, LATENCY_DEADLINE_TAU)
+    def run(self):
+        """Starts the main server loop to listen for channel connections."""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind((self.host, self.port))
+                s.listen()
+                logging.info(f"Receiver is listening on {self.host}:{self.port}...")
+                
+                while True:
+                    try:
+                        conn, addr = s.accept()
+                        # This design is simple and handles one connection at a time,
+                        # which is fine for your sequential DRL loop.
+                        self.handle_client(conn, addr)
+                    except Exception as e:
+                        logging.error(f"Error accepting connection: {e}")
+        except OSError as e:
+            logging.critical(f"Failed to bind socket: {e}. Exiting.")
 
-            send_feedback(reward, observed_noise, observed_bandwidth)
 
-            # --- Logging ---
-            decoded_label, similarity = decode_semantic_meaning(reconstructed_vector, knowledge_base)
-            
-            print(f"Received {log_msg_type} for: {original_label}")
-            print(f"-> Decoded Meaning: **{decoded_label}** (Similarity: {similarity:.4f})")
-            print(f"Latency: {total_latency:.4f}s")
-            print(f"Semantic Loss (MSE): {semantic_loss:.4f}")
-            print(f"Network State: (Noise: {observed_noise:.3f}, BW: {observed_bandwidth:.2f})")
-            print(f"Calculated Reward: {reward:.4f}")
-
-            if original_label == decoded_label:
-                print("✅ SUCCESS: Meaning was recovered.")
-            else:
-                print("❌ FAILURE: Meaning was lost.")
+if __name__ == "__main__":
+    receiver = Receiver(
+        host=DEFAULT_HOST,
+        port=DEFAULT_PORT,
+        image_dir=DEFAULT_IMAGE_DIR,
+        classes=DEFAULT_CLASSES,
+        sender_host=DEFAULT_SENDER_HOST,
+        feedback_port=DEFAULT_SENDER_FEEDBACK_PORT,
+        deadline=DEFAULT_LATENCY_DEADLINE_TAU,
+        alpha=DEFAULT_ALPHA_WEIGHT
+    )
+    receiver.run()
