@@ -11,7 +11,6 @@ import threading
 import struct
 import io
 
-# --- NEW IN PHASE 2: DRL Imports ---
 import gymnasium as gym
 from gymnasium import spaces
 from stable_baselines3 import DQN
@@ -29,21 +28,21 @@ IMAGE_FILENAMES = ['cat.jpeg', 'car.jpeg', 'dog.jpeg']
 FEEDBACK_HOST = '0.0.0.0'
 FEEDBACK_PORT = 65500
 
-# --- NEW IN PHASE 2: DRL Agent Config ---
+# --- NEW IN PHASE 3: DRL Agent Config ---
 ACTION_SEMANTIC = 0
 ACTION_RAW = 1
 
-# State: [cpu_load_percent, mem_load_percent, data_size_kb]
-STATE_SPACE_LOW = np.array([0.0, 0.0, 50.0], dtype=np.float32)
-STATE_SPACE_HIGH = np.array([100.0, 100.0, 2048.0], dtype=np.float32)
+# State: [cpu, mem, data_size, last_noise, last_bandwidth]
+STATE_SPACE_LOW = np.array([0.0, 0.0, 50.0, 0.0, 1.0], dtype=np.float32)
+STATE_SPACE_HIGH = np.array([100.0, 100.0, 2048.0, 0.5, 20.0], dtype=np.float32)
 
 TOTAL_TRAINING_STEPS = 50000
 BATCH_SIZE = 32
 REPLAY_BUFFER_SIZE = 10000
-LEARNING_STARTS = 100 # Start training after 100 steps
-TRAIN_FREQUENCY = 4   # Train every 4 steps
+LEARNING_STARTS = 100 
+TRAIN_FREQUENCY = 4
 
-# Thread-safe queue to pass rewards from listener to main loop
+# Feedback queue now expects a tuple: (reward, noise, bandwidth)
 feedback_queue = queue.Queue()
 
 # --- MODEL SETUP ---
@@ -53,38 +52,25 @@ feature_extractor = torch.nn.Sequential(*list(model.children())[:-1])
 feature_extractor.eval()
 preprocess = weights.transforms()
 
-# --- THIS IS THE FIX: Create a dummy env to hold spaces ---
+# --- Dummy env to hold spaces ---
 class DummyEnv(gym.Env):
-    """
-    A minimal gym.Env class to hold our observation and action spaces.
-    This is required by the SB3 model constructor, even if we
-    manually drive the training loop.
-    """
     def __init__(self):
         super(DummyEnv, self).__init__()
-        # State: [cpu_load_percent, mem_load_percent, data_size_kb]
+        # --- NEW IN PHASE 3: 5-dimensional state space ---
         self.observation_space = spaces.Box(
             low=STATE_SPACE_LOW, 
             high=STATE_SPACE_HIGH, 
             dtype=np.float32
         )
-        # Action 0=Semantic, 1=Raw
         self.action_space = spaces.Discrete(2)
-    
-    # We don't need to implement these, as we'll never call model.learn(env)
-    def step(self, action):
-        pass
-    def reset(self, seed=None, options=None):
-        pass
-# --- END OF FIX ---
+    def step(self, action): pass
+    def reset(self, seed=None, options=None): pass
 
 
 def get_image_feature_vector(image_path):
-    """Loads an image from path and extracts its feature vector."""
     img = Image.open(image_path).convert('RGB')
     img_t = preprocess(img)
     batch_t = torch.unsqueeze(img_t, 0)
-
     with torch.no_grad():
         features = feature_extractor(batch_t)
         vector = features.squeeze().numpy()
@@ -93,7 +79,7 @@ def get_image_feature_vector(image_path):
 # --- REWARD LISTENER ---
 def reward_listener_thread():
     """
-    Listens for reward feedback and puts it in a thread-safe queue.
+    Listens for feedback (reward, noise, bw) and puts it in the queue.
     """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind((FEEDBACK_HOST, FEEDBACK_PORT))
@@ -103,34 +89,35 @@ def reward_listener_thread():
             try:
                 conn, addr = s.accept()
                 with conn:
-                    data = conn.recv(1024)
-                    if not data:
+                    # --- NEW IN PHASE 3: Receive 3 floats (12 bytes) ---
+                    data = conn.recv(12) 
+                    if not data or len(data) != 12:
                         continue
                     
-                    reward = np.frombuffer(data, dtype=np.float32)[0]
-                    # --- NEW IN PHASE 2: Use queue ---
-                    feedback_queue.put(reward)
+                    # Unpack the 3-float array
+                    feedback_data = np.frombuffer(data, dtype=np.float32)
+                    reward = feedback_data[0]
+                    noise = feedback_data[1]
+                    bandwidth = feedback_data[2]
+                    
+                    # Put the full tuple into the queue
+                    feedback_queue.put((reward, noise, bandwidth))
                     
             except Exception as e:
                 print(f"Error in feedback listener: {e}")
 
-# --- NEW IN PHASE 2: DRL Helper Functions ---
-def get_current_state():
+# --- DRL Helper Functions ---
+def get_local_state():
     """
     Gets the sender's local resource state and a simulated task.
     """
     cpu = psutil.cpu_percent()
     mem = psutil.virtual_memory().percent
-    
-    # Simulate a new task (data size in KB)
     data_size = np.random.randint(STATE_SPACE_LOW[2], STATE_SPACE_HIGH[2])
     
     return np.array([cpu, mem, data_size], dtype=np.float32)
 
 def send_message(sock, message_payload):
-    """
-    Frames and sends a message (header + payload).
-    """
     msg_len_header = struct.pack('!I', len(message_payload))
     sock.sendall(msg_len_header)
     sock.sendall(message_payload)
@@ -141,45 +128,42 @@ print("Sender is starting...")
 listener_thread = threading.Thread(target=reward_listener_thread, daemon=True)
 listener_thread.start()
 
-# --- NEW IN PHASE 2: Initialize DRL Agent ---
-
-# --- THIS IS THE FIX ---
-# 1. Create an instance of the dummy env
+# --- Initialize DRL Agent ---
 dummy_env = DummyEnv()
 
-# 2. Pass the dummy_env *instance* as the 'env' argument
 model = DQN(
     "MlpPolicy",
-    dummy_env,  # <-- This is the fix
-    # observation_space=...  <-- REMOVE THIS
-    # action_space=...       <-- REMOVE THIS
+    dummy_env,
     learning_rate=1e-4,
     buffer_size=REPLAY_BUFFER_SIZE,
     learning_starts=LEARNING_STARTS,
     batch_size=BATCH_SIZE,
     train_freq=TRAIN_FREQUENCY,
-    gradient_steps=-1, # We will manually call train()
+    gradient_steps=-1,
     target_update_interval=1000,
     verbose=1
 )
 
-# 3. Initialize the replay buffer using the spaces from the dummy_env
 model.replay_buffer = ReplayBuffer(
     model.buffer_size,
-    dummy_env.observation_space, # <-- Get space from dummy_env
-    dummy_env.action_space,      # <-- Get space from dummy_env
+    dummy_env.observation_space,
+    dummy_env.action_space,
     model.device,
     n_envs=1,
     optimize_memory_usage=False
 )
-# --- END OF FIX ---
-
 
 time.sleep(10) # Give other services time to start up
 
 # --- Main Training Loop ---
 print("--- Starting DRL Training Loop ---")
-state = get_current_state()
+
+# --- NEW IN PHASE 3: Initialize state components ---
+local_state = get_local_state()
+# Initial (dummy) network state: no noise, 10 Mbps bandwidth
+network_state = np.array([0.0, 10.0], dtype=np.float32) 
+state = np.concatenate((local_state, network_state))
+
 
 try:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -189,19 +173,16 @@ try:
 
         for step in range(1, TOTAL_TRAINING_STEPS + 1):
             
-            # 1. AGENT: Select Action
-            # Use epsilon-greedy policy to explore
+            # 1. AGENT: Select Action based on current state
             action, _ = model.predict(state, deterministic=False)
             
             # 2. SENDER: Perform Action
             send_timestamp = time.time()
             
-            # Pick a random image for this step's task
             image_name = random.choice(IMAGE_FILENAMES)
             image_path = os.path.join(IMAGE_DIR, image_name)
             label = image_name.split('.')[0]
             
-            # Common parts of the message
             timestamp_bytes = np.array([send_timestamp], dtype=np.float64).tobytes()
             label_bytes = label.encode('utf-8')
 
@@ -217,24 +198,27 @@ try:
                 type_bytes = b"RAW"
                 log_msg_type = "RAW"
 
-            # NEW FORMAT: TYPE | timestamp | label | payload
             message = type_bytes + b'|' + timestamp_bytes + b'|' + label_bytes + b'|' + payload
             
-            print(f"Step {step}: Sending {log_msg_type} for '{label}'")
+            print(f"Step {step}: State={np.round(state, 2)}")
+            print(f"  -> Action: {log_msg_type}")
             send_message(s, message)
             
             # 3. ENVIRONMENT: (Receiver/Channel process the action)
             
             # 4. SENDER: Receive Feedback
-            # This blocks until the reward_listener thread puts something in the queue
             try:
-                reward = feedback_queue.get(timeout=10.0) # 10 sec timeout
+                # --- NEW IN PHASE 3: Get full feedback package ---
+                reward, noise, bandwidth = feedback_queue.get(timeout=20.0) # Increased timeout
             except queue.Empty:
                 print("Feedback timeout! Skipping step.")
                 continue
 
             # 5. AGENT: Learn
-            next_state = get_current_state()
+            # --- NEW IN PHASE 3: Construct next_state ---
+            next_local_state = get_local_state()
+            next_network_state = np.array([noise, bandwidth], dtype=np.float32)
+            next_state = np.concatenate((next_local_state, next_network_state))
             
             # Add experience to replay buffer
             model.replay_buffer.add(state, next_state, action, reward, done=False, infos=[{}])
@@ -247,8 +231,7 @@ try:
                 model.train(gradient_steps=1)
             
             if step % 100 == 0:
-                print(f"--- Step {step} ---")
-                # Save the model periodically
+                print(f"--- Step {step}, Last Reward: {reward:.3f} ---")
                 model.save("drl_agent_checkpoint")
 
 except Exception as e:

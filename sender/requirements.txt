@@ -1,4 +1,8 @@
+# sender/requirements.txt
+
 torch
 torchvision
 numpy
-Pillow
+psutil
+gymnasium
+stable-baselines3[extra]
