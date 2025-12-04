@@ -1,7 +1,7 @@
 import socket
 import torch
 import torchvision.transforms as transforms
-from torchvision.models import resnet18, ResNet18_Weights
+from utils.models import Decoder # Import custom Decoder
 from PIL import Image
 import os
 import numpy as np
@@ -10,6 +10,7 @@ import io
 import pickle
 import logging
 from typing import Dict, Any, Optional
+from torch.utils.tensorboard import SummaryWriter
 
 # --- Setup basic logging ---
 logging.basicConfig(level=logging.INFO,
@@ -49,52 +50,81 @@ class Receiver:
         self.deadline_tau = deadline
         self.alpha_weight = alpha
 
-        # --- Model Initialization ---
-        logging.info("Initializing ResNet-18 feature extractor...")
-        self.weights = ResNet18_Weights.DEFAULT
-        self.model = resnet18(weights=self.weights)
-        self.feature_extractor = torch.nn.Sequential(*list(self.model.children())[:-1])
-        self.feature_extractor.eval()
-        self.preprocess = self.weights.transforms()
+        # --- Initialize Decoder ---
+        logging.info("Initializing Custom Decoder...")
+        self.decoder = Decoder(encoded_space_dim=512)
+        
+        # Load pre-trained weights if available
+        ae_weights_path = "/app/models/autoencoder_cifar10.pth"
+        if os.path.exists(ae_weights_path):
+            logging.info(f"Loading pre-trained Autoencoder weights from {ae_weights_path}...")
+            try:
+                state_dict = torch.load(ae_weights_path, map_location='cpu')
+                # Filter for decoder keys only (prefix 'decoder.')
+                # Autoencoder has self.decoder = Decoder(). So keys are 'decoder.decoder_lin...'
+                # Decoder expects 'decoder_lin...'
+                
+                decoder_state_dict = {k.replace('decoder.', ''): v for k, v in state_dict.items() if k.startswith('decoder.')}
+                self.decoder.load_state_dict(decoder_state_dict)
+                logging.info("Decoder weights loaded successfully.")
+            except Exception as e:
+                logging.error(f"Failed to load decoder weights: {e}")
+        else:
+            logging.warning("No pre-trained weights found. Using random initialization.")
+        self.decoder.eval()
+        
+        # Transform for GT image (to match Decoder output)
+        self.preprocess = transforms.Compose([
+            transforms.Resize((32, 32)),
+            transforms.ToTensor(), # Converts to [0, 1]
+        ])
         
         # --- Knowledge Base Initialization ---
-        self.knowledge_base = self._create_knowledge_base()
+        # self.knowledge_base = self._create_knowledge_base() # Removed: We now receive GT vector
+        
+        # --- TensorBoard Logging ---
+        logging.info("Initializing TensorBoard SummaryWriter...")
+        self.writer = SummaryWriter(log_dir="/app/runs/receiver_logs")
+        self.step_counter = 0
 
-    def _get_vector_from_image(self, img: Image.Image) -> np.ndarray:
-        """Extracts a feature vector from a PIL Image object."""
-        img_t = self.preprocess(img)
-        batch_t = torch.unsqueeze(img_t, 0)
+    def _decode_vector(self, vector: np.ndarray) -> torch.Tensor:
+        """Decodes the semantic vector into an image tensor."""
         with torch.no_grad():
-            features = self.feature_extractor(batch_t)
-            return features.squeeze().numpy()
+            # Vector is numpy, convert to tensor
+            z = torch.from_numpy(vector).float().unsqueeze(0) # Add batch dim
+            reconstructed_img = self.decoder(z)
+            return reconstructed_img.squeeze(0) # Remove batch dim -> [C, H, W]
 
     def _get_image_feature_vector(self, image_path: str) -> np.ndarray:
         """Utility function to extract feature vector from a file path."""
         img = Image.open(image_path).convert('RGB')
         return self._get_vector_from_image(img)
 
-    def _create_knowledge_base(self) -> Dict[str, np.ndarray]:
-        """
-        Generates the ideal feature vector for each known class and stores it.
-        This is the receiver's semantic "ground truth".
-        """
-        logging.info("Creating receiver's knowledge base...")
-        knowledge_base = {}
-        for class_name in self.classes:
-            image_path = f"{self.image_dir}/{class_name}.jpeg"
-            if not os.path.exists(image_path):
-                logging.warning(f"Image file not found {image_path}. Skipping.")
-                continue
-            knowledge_base[class_name] = self._get_image_feature_vector(image_path)
-            logging.info(f" - Generated vector for '{class_name}'")
-        return knowledge_base
+    # def _create_knowledge_base(self) -> Dict[str, np.ndarray]:
+    #     """
+    #     Generates the ideal feature vector for each known class and stores it.
+    #     This is the receiver's semantic "ground truth".
+    #     """
+    #     logging.info("Creating receiver's knowledge base...")
+    #     knowledge_base = {}
+    #     for class_name in self.classes:
+    #         image_path = f"{self.image_dir}/{class_name}.jpeg"
+    #         if not os.path.exists(image_path):
+    #             logging.warning(f"Image file not found {image_path}. Skipping.")
+    #             continue
+    #         knowledge_base[class_name] = self._get_image_feature_vector(image_path)
+    #         logging.info(f" - Generated vector for '{class_name}'")
+    #     return knowledge_base
 
-    def _calculate_semantic_loss(self, ground_truth_vec: Optional[np.ndarray],
-                                 reconstructed_vec: Optional[np.ndarray]) -> float:
-        """Calculates Mean Squared Error (MSE) between two vectors."""
-        if ground_truth_vec is None or reconstructed_vec is None:
-            return 1.0  # Max penalty
-        return np.mean((ground_truth_vec - reconstructed_vec)**2)
+    def _calculate_reconstruction_loss(self, gt_image_tensor: torch.Tensor, 
+                                     reconstructed_image_tensor: torch.Tensor) -> float:
+        """Calculates MSE loss between two image tensors."""
+        if gt_image_tensor is None or reconstructed_image_tensor is None:
+            return 1.0
+        
+        # MSE Loss
+        loss = torch.nn.functional.mse_loss(reconstructed_image_tensor, gt_image_tensor)
+        return loss.item()
 
     def _calculate_reward(self, semantic_loss: float, latency: float) -> float:
         """Calculates the reward based on loss and latency."""
@@ -106,12 +136,14 @@ class Receiver:
     def _send_feedback(self, reward: float, noise: float, bandwidth: float):
         """Sends the calculated reward and observed network state back to the sender."""
         try:
+            logging.info(f"Sending feedback to {self.sender_host}:{self.feedback_port} -> Reward: {reward:.4f}")
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as feedback_sock:
                 feedback_sock.connect((self.sender_host, self.feedback_port))
                 feedback_payload = np.array([reward, noise, bandwidth], dtype=np.float32)
                 feedback_sock.sendall(feedback_payload.tobytes())
+            logging.info("Feedback sent successfully.")
         except socket.error as e:
-            logging.error(f"Error sending feedback to sender: {e}")
+            logging.error(f"Error sending feedback to sender ({self.sender_host}:{self.feedback_port}): {e}")
 
     def _cosine_similarity(self, vec1: np.ndarray, vec2: np.ndarray) -> float:
         """Calculates cosine similarity, handling potential None values."""
@@ -125,29 +157,48 @@ class Receiver:
 
     def _decode_semantic_meaning(self, reconstructed_vector: np.ndarray) -> (str, float):
         """Finds the best match for the vector from the knowledge base."""
-        max_similarity = -1.0
-        best_match = "UNKNOWN"
-        for class_name, ideal_vector in self.knowledge_base.items():
-            similarity = self._cosine_similarity(reconstructed_vector, ideal_vector)
-            if similarity > max_similarity:
-                max_similarity = similarity
-                best_match = class_name
-        return best_match, max_similarity
+        # For CIFAR-10, we don't have a static KB anymore. 
+        # We could compare to the GT vector we received, but that's trivial (sim=1.0).
+        # So we just return "Dynamic", 0.0 for now or implement a proper classifier later.
+        return "Dynamic", 0.0
 
-    def _receive_full_message(self, conn: socket.socket) -> bytes:
-        """Reads all data from a single connection until it closes."""
+    def _receive_n_bytes(self, conn: socket.socket, n: int) -> Optional[bytes]:
+        """Reads exactly n bytes from the connection."""
         buffer = b""
-        while True:
-            chunk = conn.recv(4096)
+        while len(buffer) < n:
+            chunk = conn.recv(n - len(buffer))
             if not chunk:
-                break
+                return None
             buffer += chunk
         return buffer
+
+    def _receive_message_payload(self, conn: socket.socket) -> Optional[bytes]:
+        """Receives the full message payload."""
+        logging.info("Starting to receive message payload...")
+        conn.settimeout(5.0) # Set 5s timeout to prevent hanging
+        buffer = b""
+        try:
+            while True:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    logging.info("Client closed connection (EOF).")
+                    break
+                buffer += chunk
+                # logging.info(f"Received chunk: {len(chunk)} bytes. Total: {len(buffer)}")
+            logging.info(f"Finished receiving. Total size: {len(buffer)} bytes.")
+            return buffer
+        except socket.timeout:
+            logging.warning("Socket timed out while receiving payload!")
+            return None
+        except Exception as e:
+            logging.error(f"Error receiving payload: {e}")
+            return None
 
     def _process_message(self, data: bytes):
         """
         The core business logic to unpack, decode, and handle a received message.
         """
+        logging.info(f"Processing message of size {len(data)} bytes...")
         reconstructed_vector = None
         original_label = None
         send_timestamp = None
@@ -165,6 +216,7 @@ class Receiver:
             observed_bandwidth = np.frombuffer(bw_bytes, dtype=np.float32)[0]
 
             # --- 2. Unpack the main message dictionary ---
+            logging.info("Unpickling payload...")
             message_dict: Dict[str, Any] = pickle.loads(pickled_payload)
             
             send_timestamp = message_dict['ts']
@@ -173,64 +225,76 @@ class Receiver:
             payload = message_dict['payload']
 
             # --- 3. Decode payload based on type ---
+            logging.info(f"Decoding message type: {msg_type}")
+            gt_image_bytes = message_dict.get('gt_image')
+            gt_image = None
+            if gt_image_bytes:
+                logging.info("Processing GT image...")
+                gt_img_pil = Image.open(io.BytesIO(gt_image_bytes)).convert('RGB')
+                gt_image = self.preprocess(gt_img_pil) # [C, H, W] tensor
+
             if msg_type == "SEM":
                 log_msg_type = "SEMANTIC"
-                reconstructed_vector = payload  # Payload is the noisy numpy vector
+                # Payload is the noisy vector
+                noisy_vector = payload 
+                logging.info("Running Decoder...")
+                reconstructed_image = self._decode_vector(noisy_vector)
 
             elif msg_type == "RAW":
                 log_msg_type = "RAW"
-                img_stream = io.BytesIO(payload)  # Payload is the raw image bytes
+                # Payload is the raw image bytes (same as GT in this case)
+                img_stream = io.BytesIO(payload)
                 img = Image.open(img_stream).convert('RGB')
-                reconstructed_vector = self._get_vector_from_image(img)
+                logging.info("Processing RAW image...")
+                reconstructed_image = self.preprocess(img)
 
             else:
                 logging.warning(f"Error: Unknown message type '{msg_type}'. Skipping.")
                 return
 
         except Exception as e:
-            logging.error(f"Error unpacking data: {e}. Buffer size: {len(data)}. Skipping packet.")
+            logging.error(f"Error unpacking/processing data: {e}. Buffer size: {len(data)}. Skipping packet.")
             return
 
         # --- 4. Performance Calculation ---
+        logging.info("Calculating performance...")
         reception_timestamp = time.time()
         total_latency = reception_timestamp - send_timestamp
 
-        ground_truth_vector = self.knowledge_base.get(original_label)
-        
-        if (ground_truth_vector is not None and 
-            reconstructed_vector is not None and
-            ground_truth_vector.shape != reconstructed_vector.shape):
-            
-            logging.warning(f"Shape mismatch! GT: {ground_truth_vector.shape}, Rec: {reconstructed_vector.shape}")
-            semantic_loss = 1.0 # Max penalty
-        else:
-            semantic_loss = self._calculate_semantic_loss(ground_truth_vector, reconstructed_vector)
+        # Calculate Reconstruction Loss (MSE)
+        reconstruction_loss = self._calculate_reconstruction_loss(gt_image, reconstructed_image)
 
-        reward = self._calculate_reward(semantic_loss, total_latency)
+        reward = self._calculate_reward(reconstruction_loss, total_latency)
 
         # --- 5. Send Feedback ---
+        logging.info("Sending feedback...")
         self._send_feedback(reward, observed_noise, observed_bandwidth)
 
         # --- 6. Logging ---
-        decoded_label, similarity = self._decode_semantic_meaning(reconstructed_vector)
-        
+        self.step_counter += 1
+        self.writer.add_scalar("Performance/Latency", total_latency, self.step_counter)
+        self.writer.add_scalar("Performance/ReconstructionLoss", reconstruction_loss, self.step_counter)
+        self.writer.add_scalar("Performance/Reward", reward, self.step_counter)
+        self.writer.add_scalar("Network/Noise", observed_noise, self.step_counter)
+        self.writer.add_scalar("Network/Bandwidth", observed_bandwidth, self.step_counter)
+            
+            # Log images occasionally
+        if self.step_counter % 50 == 0:
+            self.writer.add_image("Images/Reconstructed", reconstructed_image, self.step_counter)
+            if gt_image is not None:
+                self.writer.add_image("Images/GroundTruth", gt_image, self.step_counter)
+
         logging.info(f"Received {log_msg_type} for: {original_label}")
-        logging.info(f"-> Decoded Meaning: **{decoded_label}** (Similarity: {similarity:.4f})")
         logging.info(f"Latency: {total_latency:.4f}s")
-        logging.info(f"Semantic Loss (MSE): {semantic_loss:.4f}")
+        logging.info(f"Reconstruction Loss (MSE): {reconstruction_loss:.4f}")
         logging.info(f"Network State: (Noise: {observed_noise:.3f}, BW: {observed_bandwidth:.2f})")
         logging.info(f"Calculated Reward: {reward:.4f}")
-
-        if original_label == decoded_label:
-            logging.info("✅ SUCCESS: Meaning was recovered.")
-        else:
-            logging.info("❌ FAILURE: Meaning was lost.")
 
     def handle_client(self, conn: socket.socket, addr):
         """Manages a single connection from the channel."""
         logging.info(f"Connected by {addr}")
         try:
-            data = self._receive_full_message(conn)
+            data = self._receive_message_payload(conn)
             if not data:
                 logging.info(f"Received an empty message from {addr}. Skipping.")
             else:

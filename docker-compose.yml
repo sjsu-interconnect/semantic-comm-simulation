@@ -3,14 +3,22 @@ services:
     build: ./sender
     volumes:
       - ./images:/app/images:ro
+      - ./runs:/app/runs
+      - ./models:/app/models
+      - ./sender/utils:/app/utils:ro # Mount utils to ensure it's available and up-to-date
     expose:
       - "65500"  # <-- ADD THIS LINE
+    environment:
+      - DATASET_TYPE=CIFAR10 # Options: CIFAR10, STL10, CUSTOM
     # ... other sender config ...
 
   receiver:
     build: ./receiver
     volumes:
       - ./images:/app/images:ro
+      - ./runs:/app/runs
+      - ./models:/app/models
+      - ./sender/utils:/app/utils:ro # Share utils from sender
     ports:
       - "65432:65432" # This is fine if you want to see receiver output
     depends_on:

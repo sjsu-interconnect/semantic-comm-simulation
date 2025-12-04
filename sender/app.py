@@ -3,8 +3,9 @@ import time
 import random
 import os
 import torch
+import torchvision
 import torchvision.transforms as transforms
-from torchvision.models import resnet18, ResNet18_Weights
+from utils.models import Encoder # Import custom Encoder
 from PIL import Image
 import numpy as np
 import threading
@@ -18,7 +19,8 @@ import psutil
 import queue
 import pickle
 import logging
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, List
+from torch.utils.data import Dataset
 
 # --- Setup basic logging ---
 logging.basicConfig(level=logging.INFO,
@@ -28,8 +30,10 @@ logging.basicConfig(level=logging.INFO,
 # --- CONFIGURATION CONSTANTS ---
 CHANNEL_HOST = 'channel'
 CHANNEL_PORT = 65431
-IMAGE_DIR = '/app/images'
-IMAGE_FILENAMES = ['cat.jpeg', 'car.jpeg', 'dog.jpeg']
+CHANNEL_HOST = 'channel'
+CHANNEL_PORT = 65431
+# IMAGE_DIR = '/app/images' # Removed in favor of CIFAR-10
+# IMAGE_FILENAMES = ['cat.jpeg', 'car.jpeg', 'dog.jpeg'] # Removed
 
 # --- FEEDBACK CONFIG ---
 FEEDBACK_HOST = '0.0.0.0'
@@ -41,7 +45,7 @@ ACTION_RAW = 1
 STATE_SPACE_LOW = np.array([0.0, 0.0, 50.0, 0.0, 1.0], dtype=np.float32)
 STATE_SPACE_HIGH = np.array([100.0, 100.0, 2048.0, 0.5, 20.0], dtype=np.float32)
 
-TOTAL_TRAINING_STEPS = 50000
+TOTAL_TRAINING_STEPS = 100000
 BATCH_SIZE = 32
 REPLAY_BUFFER_SIZE = 10000
 LEARNING_STARTS = 100
@@ -64,6 +68,76 @@ class DummyEnv(gym.Env):
     def reset(self, seed=None, options=None): pass
 
 
+class CustomImageDataset(Dataset):
+    """
+    A custom dataset that loads images from a flat directory.
+    Assumes filenames are like 'cat_01.jpg' where 'cat' is the label.
+    """
+    def __init__(self, root_dir: str, transform=None):
+        self.root_dir = root_dir
+        self.transform = transform
+        self.image_paths = []
+        self.labels = []
+        self.classes = set()
+
+        # Scan directory
+        if not os.path.exists(root_dir):
+            logging.warning(f"Custom dataset directory {root_dir} does not exist.")
+            return
+
+        for filename in os.listdir(root_dir):
+            if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+                self.image_paths.append(os.path.join(root_dir, filename))
+                # Derive label from filename (e.g., "cat_01.jpg" -> "cat")
+                # Split by '_' or '.' and take the first part
+                label = filename.split('_')[0].split('.')[0]
+                self.labels.append(label)
+                self.classes.add(label)
+        
+        self.classes = sorted(list(self.classes))
+        self.class_to_idx = {cls_name: i for i, cls_name in enumerate(self.classes)}
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        image = Image.open(img_path).convert("RGB")
+        label_str = self.labels[idx]
+        label_idx = self.class_to_idx[label_str]
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, label_idx
+
+
+def load_dataset(dataset_type: str) -> Tuple[Any, List[str]]:
+    """
+    Factory function to load the requested dataset.
+    Returns (dataset, classes_list).
+    """
+    logging.info(f"Loading dataset: {dataset_type}")
+    
+    if dataset_type == 'CIFAR10':
+        dataset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=None)
+        return dataset, dataset.classes
+        
+    elif dataset_type == 'STL10':
+        # STL-10 images are 96x96
+        dataset = torchvision.datasets.STL10(root='./data', split='test', download=True, transform=None)
+        return dataset, dataset.classes
+        
+    elif dataset_type == 'CUSTOM':
+        dataset = CustomImageDataset(root_dir='/app/images', transform=None)
+        return dataset, dataset.classes
+        
+    else:
+        logging.warning(f"Unknown dataset type '{dataset_type}'. Fallback to CIFAR10.")
+        dataset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=None)
+        return dataset, dataset.classes
+
+
 class SenderAgent:
     """
     The main DRL Agent class.
@@ -75,8 +149,6 @@ class SenderAgent:
         # --- Store configuration ---
         self.channel_host = CHANNEL_HOST
         self.channel_port = CHANNEL_PORT
-        self.image_dir = IMAGE_DIR
-        self.image_filenames = IMAGE_FILENAMES
         self.feedback_host = FEEDBACK_HOST
         self.feedback_port = FEEDBACK_PORT
         
@@ -92,48 +164,109 @@ class SenderAgent:
         
         # --- Thread-safe queue for feedback ---
         self.feedback_queue = queue.Queue()
+        
+        # --- Aggregate Stats ---
+        self.semantic_count = 0
+        self.raw_count = 0
 
-        # --- Initialize Feature Extractor ---
-        logging.info("Initializing ResNet-18 feature extractor...")
-        weights = ResNet18_Weights.DEFAULT
-        model = resnet18(weights=weights)
-        self.feature_extractor = torch.nn.Sequential(*list(model.children())[:-1])
+        # --- Initialize Feature Extractor (Encoder) ---
+        logging.info("Initializing Custom Encoder...")
+        self.feature_extractor = Encoder(encoded_space_dim=512)
+        
+        # Load pre-trained weights if available
+        ae_weights_path = "/app/models/autoencoder_cifar10.pth"
+        if os.path.exists(ae_weights_path):
+            logging.info(f"Loading pre-trained Autoencoder weights from {ae_weights_path}...")
+            try:
+                state_dict = torch.load(ae_weights_path, map_location='cpu')
+                # Filter for encoder keys only (prefix 'encoder_')
+                # Our Encoder class keys match the Autoencoder's keys if we strip nothing, 
+                # BUT the Autoencoder class has 'encoder' submodule.
+                # Let's check how Autoencoder is defined in models.py.
+                # It has self.encoder = Encoder(). So keys will be 'encoder.encoder_cnn.0.weight' etc.
+                # The Encoder class expects 'encoder_cnn.0.weight'.
+                # So we need to strip 'encoder.' prefix.
+                
+                encoder_state_dict = {k.replace('encoder.', ''): v for k, v in state_dict.items() if k.startswith('encoder.')}
+                self.feature_extractor.load_state_dict(encoder_state_dict)
+                logging.info("Encoder weights loaded successfully.")
+            except Exception as e:
+                logging.error(f"Failed to load encoder weights: {e}")
+        else:
+            logging.warning("No pre-trained weights found. Using random initialization.")
+        # Load pre-trained weights if available, otherwise random init is fine for DRL to learn?
+        # Ideally we should pre-train the AE. For now, we use random init and let DRL learn?
+        # No, DRL learns the policy, not the AE. 
+        # The AE should be pre-trained OR trained online. 
+        # For this emulation, let's assume random init is "untrained" or load if exists.
+        # We will just use random init for now as per plan.
         self.feature_extractor.eval()
-        self.preprocess = weights.transforms()
+        self.preprocess = transforms.Compose([
+            transforms.Resize((32, 32)),
+            transforms.ToTensor(),
+        ])
+
+        # --- Initialize Dataset ---
+        dataset_type = 'CIFAR10'
+        self.dataset, self.classes = load_dataset(dataset_type)
+        
+        if len(self.dataset) == 0:
+            logging.error("Dataset is empty! Please check configuration.")
 
         # --- Initialize DRL Agent ---
         logging.info("Initializing DRL Agent (DQN)...")
         dummy_env = DummyEnv()
-        self.model = DQN(
-            "MlpPolicy",
-            dummy_env,
-            learning_rate=LEARNING_RATE,
-            buffer_size=REPLAY_BUFFER_SIZE,
-            learning_starts=LEARNING_STARTS,
-            batch_size=BATCH_SIZE,
-            train_freq=TRAIN_FREQUENCY,
-            gradient_steps=-1, # We train manually
-            target_update_interval=TARGET_UPDATE_INTERVAL,
-            verbose=0 # Set to 1 for more SB3 output
-        )
-        # Initialize the replay buffer
-        self.model.replay_buffer = ReplayBuffer(
-            self.model.buffer_size,
-            dummy_env.observation_space,
-            dummy_env.action_space,
-            self.model.device,
-            n_envs=1,
-            optimize_memory_usage=False
-        )
+        
+        # Check for existing model to load
+        load_model_path = os.environ.get('LOAD_MODEL')
+        if load_model_path and os.path.exists(f"/app/models/{load_model_path}.zip"):
+            logging.info(f"Loading model from {load_model_path}...")
+            self.model = DQN.load(f"/app/models/{load_model_path}", env=dummy_env)
+            # Re-set buffer if needed, though load usually handles it. 
+            # We need to ensure replay buffer is initialized if we want to continue training.
+            if self.model.replay_buffer is None:
+                 self.model.replay_buffer = ReplayBuffer(
+                    self.model.buffer_size,
+                    dummy_env.observation_space,
+                    dummy_env.action_space,
+                    self.model.device,
+                    n_envs=1,
+                    optimize_memory_usage=False
+                )
+        else:
+            self.model = DQN(
+                "MlpPolicy",
+                dummy_env,
+                learning_rate=LEARNING_RATE,
+                buffer_size=REPLAY_BUFFER_SIZE,
+                learning_starts=LEARNING_STARTS,
+                batch_size=BATCH_SIZE,
+                train_freq=TRAIN_FREQUENCY,
+                gradient_steps=-1, # We train manually
+                target_update_interval=TARGET_UPDATE_INTERVAL,
+                verbose=1,
+                tensorboard_log="/app/runs/sender_logs"
+            )
+            # Initialize the replay buffer
+            self.model.replay_buffer = ReplayBuffer(
+                self.model.buffer_size,
+                dummy_env.observation_space,
+                dummy_env.action_space,
+                self.model.device,
+                n_envs=1,
+                optimize_memory_usage=False
+            )
 
-    def _get_image_feature_vector(self, image_path: str) -> np.ndarray:
-        """Loads an image from path and extracts its feature vector."""
-        img = Image.open(image_path).convert('RGB')
+    def _get_image_feature_vector(self, img: Image.Image) -> np.ndarray:
+        """Extracts feature vector from a PIL Image using the Encoder."""
+        # Ensure image is RGB
+        img = img.convert('RGB')
         img_t = self.preprocess(img)
         batch_t = torch.unsqueeze(img_t, 0)
         with torch.no_grad():
-            features = self.feature_extractor(batch_t)
-            vector = features.squeeze().numpy()
+            # Encoder returns flattened vector
+            vector = self.feature_extractor(batch_t)
+            vector = vector.squeeze().numpy()
         return vector
 
     def _reward_listener_thread(self):
@@ -187,24 +320,47 @@ class SenderAgent:
         Returns the message dict and a string for logging.
         """
         send_timestamp = time.time()
-        image_name = random.choice(self.image_filenames)
-        image_path = os.path.join(self.image_dir, image_name)
-        label = image_name.split('.')[0]
         
+        # Pick a random image from the dataset
+        if len(self.dataset) > 0:
+            idx = random.randint(0, len(self.dataset) - 1)
+            img, label_idx = self.dataset[idx] # img is PIL Image
+            label = self.classes[label_idx]
+        else:
+            # Fallback if dataset is empty
+            img = Image.new('RGB', (32, 32), color='red')
+            label = "error"
+        
+        # Calculate Ground Truth Vector (for semantic loss calculation if needed)
+        # BUT for Reconstruction, we need the GT IMAGE.
+        # We send the GT Image as bytes in 'gt_image' field.
+        
+        # Convert PIL image to bytes for GT
+        img_byte_arr = io.BytesIO()
+        img.save(img_byte_arr, format='JPEG')
+        gt_image_bytes = img_byte_arr.getvalue()
+
         message_dict = {
             'ts': send_timestamp,
-            'label': label
+            'label': label,
+            'gt_image': gt_image_bytes # Send GT Image for reconstruction loss
         }
 
         if action == self.action_semantic:
+            self.semantic_count += 1
             message_dict['type'] = 'SEM'
-            message_dict['payload'] = self._get_image_feature_vector(image_path)
+            # Send the semantic vector (compressed)
+            vector = self._get_image_feature_vector(img)
+            message_dict['payload'] = vector
             log_msg_type = "SEMANTIC"
             
         else:  # ACTION_RAW
+            self.raw_count += 1
             message_dict['type'] = 'RAW'
-            with open(image_path, 'rb') as f:
-                message_dict['payload'] = f.read()
+            # Convert PIL image to bytes
+            img_byte_arr = io.BytesIO()
+            img.save(img_byte_arr, format='JPEG')
+            message_dict['payload'] = img_byte_arr.getvalue()
             log_msg_type = "RAW"
             
         return message_dict, log_msg_type
@@ -242,7 +398,7 @@ class SenderAgent:
                     
                     # 3. SENDER: Receive Feedback
                     try:
-                        reward, noise, bandwidth = self.feedback_queue.get(timeout=20.0)
+                        reward, noise, bandwidth = self.feedback_queue.get(timeout=60.0)
                     except queue.Empty:
                         logging.warning("Feedback timeout! Skipping step.")
                         continue
@@ -263,16 +419,24 @@ class SenderAgent:
                         self.model.train(gradient_steps=1)
                     
                     if step % 100 == 0:
+                        total_sent = self.semantic_count + self.raw_count
+                        sem_pct = (self.semantic_count / total_sent) * 100 if total_sent > 0 else 0
                         logging.info(f"--- Step {step}, Last Reward: {reward:.3f} ---")
-                        self.model.save("drl_agent_checkpoint")
+                        logging.info(f"--- Aggregate Stats: Total={total_sent}, SEM={self.semantic_count} ({sem_pct:.1f}%), RAW={self.raw_count} ---")
+                        self.model.save(f"/app/models/drl_agent_checkpoint_{step}")
 
         except socket.error as e:
             logging.error(f"Socket error in main loop: {e}. Exiting.")
         except Exception as e:
             logging.error(f"An error occurred in the main loop: {e}. Exiting.")
         finally:
+            total_sent = self.semantic_count + self.raw_count
+            sem_pct = (self.semantic_count / total_sent) * 100 if total_sent > 0 else 0
             logging.info("Training finished. Saving final model.")
-            self.model.save("drl_agent_final")
+            logging.info(f"=== FINAL STATS === Total Steps: {total_sent}")
+            logging.info(f"=== SEMANTIC: {self.semantic_count} ({sem_pct:.1f}%)")
+            logging.info(f"=== RAW: {self.raw_count} ({100-sem_pct:.1f}%)")
+            self.model.save("/app/models/drl_agent_final")
 
 if __name__ == "__main__":
     agent = SenderAgent()

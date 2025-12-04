@@ -1,8 +1,7 @@
-# sender/requirements.txt
-
 torch
 torchvision
 numpy
 psutil
 gymnasium
 stable-baselines3[extra]
+tensorboard
