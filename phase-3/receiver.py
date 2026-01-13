@@ -14,6 +14,14 @@ PORT = 65432
 IMAGE_DIR = '/app/images'
 CLASSES = ['cat', 'car', 'dog']
 
+# --- SIMULATED TIMES (Seconds) ---
+# Must match Sender's values for correct "End-to-End" simulation
+SIM_ENC_SEMANTIC = 0.100
+SIM_ENC_RAW = 0.005
+
+SIM_DEC_SEMANTIC = 0.050
+SIM_DEC_RAW = 0.010
+
 # --- FEEDBACK CONFIG ---
 SENDER_HOST = 'sender'
 SENDER_FEEDBACK_PORT = 65500
@@ -115,6 +123,9 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 if not chunk:
                     break
                 buffer += chunk
+            
+            # --- Capture Reception Timestamp Immediately ---
+            reception_timestamp = time.time()
             data = buffer
 
             if not data:
@@ -129,6 +140,10 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             # --- NEW IN PHASE 3: Network state variables ---
             observed_noise = -1.0
             observed_bandwidth = -1.0
+            
+            # For latency calc
+            sim_enc_time = 0.0
+            sim_dec_time = 0.0
 
             try:
                 # --- NEW IN PHASE 3: 5-Part Message Format ---
@@ -150,12 +165,16 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 if type_bytes == b"SEM":
                     log_msg_type = "SEMANTIC"
                     reconstructed_vector = np.frombuffer(payload, dtype=np.float32)
+                    sim_enc_time = SIM_ENC_SEMANTIC
+                    sim_dec_time = SIM_DEC_SEMANTIC
 
                 elif type_bytes == b"RAW":
                     log_msg_type = "RAW"
                     img_stream = io.BytesIO(payload)
                     img = Image.open(img_stream).convert('RGB')
                     reconstructed_vector = get_vector_from_image(img)
+                    sim_enc_time = SIM_ENC_RAW
+                    sim_dec_time = SIM_DEC_RAW
 
                 else:
                     print(f"Error: Unknown message type '{type_bytes}'. Skipping.")
@@ -165,9 +184,12 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 print(f"Error unpacking data: {e}. Buffer size: {len(data)}. Skipping packet.")
                 continue
 
-            # --- Performance Calculation (Same as Phase 1) ---
-            reception_timestamp = time.time()
-            total_latency = reception_timestamp - send_timestamp
+            # --- Performance Calculation ---
+            # network_latency = Time spent in channel (and buffers)
+            network_latency = reception_timestamp - send_timestamp
+            
+            # Total Latency = Simulated Encoding + Network + Simulated Decoding
+            total_latency = sim_enc_time + network_latency + sim_dec_time
 
             ground_truth_vector = knowledge_base.get(original_label)
             

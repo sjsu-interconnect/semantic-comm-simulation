@@ -112,12 +112,13 @@ graph TD
 ### 1. Pre-train the Autoencoder (Crucial!)
 The semantic communication relies on a trained Autoencoder. If you don't have one, the semantic actions will produce garbage, and the agent will learn to hate them.
 
-Run the training script (can be done inside the container or locally if you have valid paths):
+Run the training script (using the container is recommended):
 ```bash
-# Example if running locally with correct paths
-python sender/train_ae.py
-# OR ensure 'models/autoencoder_cifar10.pth' exists
+docker-compose run --rm --build sender python train_dual_models.py
 ```
+This produces the following weight files in `./models/`:
+*   `mobilenet_encoder.pth` & `simple_decoder.pth` (Local)
+*   `resnet_encoder.pth` & `complex_decoder.pth` (Edge)
 
 ### 2. Start the Simulation
 From the root directory:
@@ -145,5 +146,5 @@ You will see logs from all services.
 ## 🛠️ Troubleshooting
 
 *   **Crash at Step 101?** ensure you have the latest code fixes (DummyEnv return values).
-*   **Agent always chooses RAW?** This usually means the Autoencoder weights are missing or not loading correctly (check `models/autoencoder_cifar10.pth`).
+*   **Agent always chooses RAW?** This usually means the model weights are missing (check `./models/`).
 *   **Connection Refused?** Ensure all containers (`edge-encoder`, `channel`, etc.) are fully healthy before the Sender starts its loop.

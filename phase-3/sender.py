@@ -32,11 +32,15 @@ FEEDBACK_PORT = 65500
 ACTION_SEMANTIC = 0
 ACTION_RAW = 1
 
+# --- SIMULATED TIMES (Seconds) ---
+SIM_ENC_SEMANTIC = 0.100
+SIM_ENC_RAW = 0.005
+
 # State: [cpu, mem, data_size, last_noise, last_bandwidth]
 STATE_SPACE_LOW = np.array([0.0, 0.0, 50.0, 0.0, 1.0], dtype=np.float32)
 STATE_SPACE_HIGH = np.array([100.0, 100.0, 2048.0, 0.5, 20.0], dtype=np.float32)
 
-TOTAL_TRAINING_STEPS = 50000
+TOTAL_TRAINING_STEPS = 100
 BATCH_SIZE = 32
 REPLAY_BUFFER_SIZE = 10000
 LEARNING_STARTS = 100 
@@ -177,13 +181,13 @@ try:
             action, _ = model.predict(state, deterministic=False)
             
             # 2. SENDER: Perform Action
-            send_timestamp = time.time()
+            # removed send_timestamp here
             
             image_name = random.choice(IMAGE_FILENAMES)
             image_path = os.path.join(IMAGE_DIR, image_name)
             label = image_name.split('.')[0]
             
-            timestamp_bytes = np.array([send_timestamp], dtype=np.float64).tobytes()
+            # Moved timestamp prep to after encoding
             label_bytes = label.encode('utf-8')
 
             if action == ACTION_SEMANTIC:
@@ -197,6 +201,12 @@ try:
                     payload = f.read()
                 type_bytes = b"RAW"
                 log_msg_type = "RAW"
+
+            # --- Capture "Ready to Send" Timestamp ---
+            # This effectively excludes the encoding time from the network latency calculation at the receiver,
+            # allowing us to add the fixed SIM_ENC constant instead.
+            send_timestamp = time.time()
+            timestamp_bytes = np.array([send_timestamp], dtype=np.float64).tobytes()
 
             message = type_bytes + b'|' + timestamp_bytes + b'|' + label_bytes + b'|' + payload
             

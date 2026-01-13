@@ -26,7 +26,20 @@ DEFAULT_CLASSES = ['cat', 'car', 'dog']
 DEFAULT_SENDER_HOST = 'sender'
 DEFAULT_SENDER_FEEDBACK_PORT = 65500
 DEFAULT_LATENCY_DEADLINE_TAU = 1.0
-DEFAULT_ALPHA_WEIGHT = 0.5
+DEFAULT_MISSED_DEADLINE_PENALTY = 10.0
+DEFAULT_ALPHA_WEIGHT = 20.0
+DEFAULT_LATENCY_PENALTY_FACTOR = 2.0
+
+# --- SIMULATED TIMES (Seconds) ---
+SIM_ENC_SEMANTIC_LOCAL = 0.200 # Slow Mobile CPU
+SIM_ENC_SEMANTIC_EDGE = 0.020  # Fast Edge GPU
+SIM_ENC_RAW = 0.005
+
+SIM_DEC_SEMANTIC = 0.050
+SIM_DEC_RAW = 0.010
+
+EDGE_QUALITY_MULTIPLIER = 0.5 # Edge model is better, so 50% less loss
+RAW_NOISE_SENSITIVITY = 10.0 # RAW is very sensitive to noise (simulating packet corruption)
 
 
 class Receiver:
@@ -50,6 +63,7 @@ class Receiver:
         self.feedback_port = feedback_port
         self.deadline_tau = deadline
         self.alpha_weight = alpha
+        self.latency_penalty_factor = DEFAULT_LATENCY_PENALTY_FACTOR
 
         # --- Initialize Decoder (Simple/Local) ---
         logging.info("Initializing Custom Decoder (Simple/Local)...")
@@ -147,9 +161,14 @@ class Receiver:
 
     def _calculate_reward(self, semantic_loss: float, latency: float) -> float:
         """Calculates the reward based on loss and latency."""
-        latency_met = 1.0 if latency <= self.deadline_tau else 0.0
-        latency_penalty = 1.0 - latency_met
-        cost = latency_penalty + self.alpha_weight * semantic_loss
+        latency_met = latency <= self.deadline_tau
+        
+        # Binary Penalty for missing deadline
+        binary_penalty = 0.0 if latency_met else DEFAULT_MISSED_DEADLINE_PENALTY
+        
+        # New Reward Function:
+        # Cost = BinaryDeadline + (LinearLatency * Factor) + (MSE * Alpha)
+        cost = binary_penalty + (latency * self.latency_penalty_factor) + (self.alpha_weight * semantic_loss)
         return -cost
 
     def _send_feedback(self, reward: float, noise: float, bandwidth: float):
@@ -213,7 +232,7 @@ class Receiver:
             logging.error(f"Error receiving payload: {e}")
             return None
 
-    def _process_message(self, data: bytes):
+    def _process_message(self, data: bytes, reception_timestamp: float):
         """
         The core business logic to unpack, decode, and handle a received message.
         """
@@ -224,6 +243,11 @@ class Receiver:
         log_msg_type = "UNKNOWN"
         observed_noise = -1.0
         observed_bandwidth = -1.0
+        
+        # For latency calc
+        sim_enc_time = 0.0
+        sim_dec_time = 0.0
+        is_edge_quality = False
 
         try:
             # --- 1. Unpack Network State from Payload ---
@@ -289,6 +313,9 @@ class Receiver:
                 noisy_vector = payload 
                 logging.info("Running Local Decoder...")
                 reconstructed_image = self._decode_vector(noisy_vector)
+                
+                sim_enc_time = SIM_ENC_SEMANTIC_LOCAL
+                sim_dec_time = SIM_DEC_SEMANTIC
 
             elif msg_type == "SEM_EDGE":
                 log_msg_type = "SEM_EDGE"
@@ -296,6 +323,21 @@ class Receiver:
                 noisy_vector = payload 
                 logging.info("Running Edge Decoder...")
                 reconstructed_image = self._decode_edge_vector(noisy_vector)
+                
+                # Edge Latency = Fast Compute + Upload Lag
+                # Simulate 50KB upload to Edge
+                edge_upload_size_bits = 50 * 1024 * 8 
+                # Avoid div by zero
+                current_bw_bps = max(1.0, observed_bandwidth) * 1_000_000
+                edge_upload_delay = edge_upload_size_bits / current_bw_bps
+                
+                sim_enc_time = SIM_ENC_SEMANTIC_EDGE + edge_upload_delay
+                sim_dec_time = SIM_DEC_SEMANTIC
+                
+                # Apply Quality Multiplier (simulate better model)
+                # We apply it to the final loss calculation later, or modify here?
+                # Let's flag it.
+                is_edge_quality = True
 
             elif msg_type == "RAW":
                 log_msg_type = "RAW"
@@ -304,6 +346,9 @@ class Receiver:
                 img = Image.open(img_stream).convert('RGB')
                 logging.info("Processing RAW image...")
                 reconstructed_image = self.preprocess(img)
+                
+                sim_enc_time = SIM_ENC_RAW
+                sim_dec_time = SIM_DEC_RAW
 
             else:
                 logging.warning(f"Error: Unknown message type '{msg_type}'. Skipping.")
@@ -315,11 +360,28 @@ class Receiver:
 
         # --- 4. Performance Calculation ---
         logging.info("Calculating performance...")
-        reception_timestamp = time.time()
-        total_latency = reception_timestamp - send_timestamp
+        # reception_timestamp is passed in now to capture network arrival time
+        
+        # Network Latency
+        network_latency = reception_timestamp - send_timestamp
+        
+        # Total Latency = Network + Sim Enc + Sim Dec
+        total_latency = network_latency + sim_enc_time + sim_dec_time
 
         # Calculate Reconstruction Loss (MSE)
         reconstruction_loss = self._calculate_reconstruction_loss(gt_image, reconstructed_image)
+        
+        # Apply Logic:
+        # 1. Edge Quality Benefit
+        if is_edge_quality:
+            reconstruction_loss *= EDGE_QUALITY_MULTIPLIER
+            
+        # 2. RAW Noise Penalty (Simulate Corruption)
+        if msg_type == "RAW" and observed_noise > 0:
+            # Simulate massive corruption proportional to noise
+            raw_corruption = RAW_NOISE_SENSITIVITY * (observed_noise ** 2)
+            reconstruction_loss += raw_corruption
+            logging.info(f"  -> Applied RAW Noise Penalty: +{raw_corruption:.4f} MSE")
 
         reward = self._calculate_reward(reconstruction_loss, total_latency)
 
@@ -357,7 +419,9 @@ class Receiver:
             if not data:
                 logging.info(f"Received an empty message from {addr}. Skipping.")
             else:
-                self._process_message(data)
+                # Capture timestamp immediately after reception!
+                reception_timestamp = time.time()
+                self._process_message(data, reception_timestamp)
         except Exception as e:
             logging.error(f"Error handling client {addr}: {e}")
         finally:

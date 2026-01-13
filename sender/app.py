@@ -23,6 +23,7 @@ import requests
 import json
 from typing import Dict, Any, Tuple, List
 from torch.utils.data import Dataset
+import csv
 
 # --- Setup basic logging ---
 logging.basicConfig(level=logging.INFO,
@@ -41,11 +42,16 @@ CHANNEL_PORT = 65431
 FEEDBACK_HOST = '0.0.0.0'
 FEEDBACK_PORT = 65500
 
+# --- SIMULATED TIMES (Seconds) ---
+SIM_ENC_SEMANTIC = 0.100
+SIM_ENC_RAW = 0.005
+
 # --- DRL Agent Config ---
 # --- DRL Agent Config ---
 ACTION_SEMANTIC_LOCAL = 0
 ACTION_RAW = 1
 ACTION_SEMANTIC_EDGE = 2
+
 STATE_SPACE_LOW = np.array([0.0, 0.0, 50.0, 0.0, 1.0], dtype=np.float32)
 STATE_SPACE_HIGH = np.array([100.0, 100.0, 2048.0, 0.5, 20.0], dtype=np.float32)
 
@@ -53,11 +59,11 @@ STATE_SPACE_HIGH = np.array([100.0, 100.0, 2048.0, 0.5, 20.0], dtype=np.float32)
 # Default to 100,000 if not set
 TOTAL_TRAINING_STEPS = int(os.environ.get('EXPERIMENT_STEPS', 100000))
 BATCH_SIZE = 32
-REPLAY_BUFFER_SIZE = 10000
+REPLAY_BUFFER_SIZE = 5000
 LEARNING_STARTS = 100
-TRAIN_FREQUENCY = 4
+TRAIN_FREQUENCY = 1
 TARGET_UPDATE_INTERVAL = 1000
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 1e-3
 
 # --- Dummy env to hold spaces (required by SB3) ---
 class DummyEnv(gym.Env):
@@ -177,6 +183,11 @@ class SenderAgent:
         self.batch_size = BATCH_SIZE
         self.learning_starts = LEARNING_STARTS
         
+        # --- Exploration Config (Epsilon-Greedy) ---
+        self.epsilon = 1.0
+        self.epsilon_min = 0.05
+        self.epsilon_decay = 0.995
+        
         # --- Thread-safe queue for feedback ---
         self.feedback_queue = queue.Queue()
         
@@ -185,8 +196,7 @@ class SenderAgent:
         self.raw_count = 0
         self.semantic_edge_count = 0
 
-from utils.models import PretrainedMobileNetEncoder # Import custom Encoder
-# ...
+
         # --- Initialize Feature Extractor (Encoder) ---
         logging.info("Initializing Custom Encoder (MobileNetV3/Local)...")
         # Use MobileNetV3 for local processing
@@ -222,7 +232,8 @@ from utils.models import PretrainedMobileNetEncoder # Import custom Encoder
 
         # --- Initialize DRL Agent ---
         logging.info("Initializing DRL Agent (DQN)...")
-        dummy_env = DummyEnv()
+        self.env = DummyEnv()
+        dummy_env = self.env
         
         # Check for existing model to load
         load_model_path = os.environ.get('LOAD_MODEL')
@@ -359,7 +370,8 @@ from utils.models import PretrainedMobileNetEncoder # Import custom Encoder
         Creates the message dictionary based on the agent's action.
         Returns the message dict and a string for logging.
         """
-        send_timestamp = time.time()
+        # send_timestamp removed from here to simulate "ready-to-send" time
+
         
         # Pick a random image from the dataset
         if len(self.dataset) > 0:
@@ -379,6 +391,11 @@ from utils.models import PretrainedMobileNetEncoder # Import custom Encoder
         img_byte_arr = io.BytesIO()
         img.save(img_byte_arr, format='JPEG')
         gt_image_bytes = img_byte_arr.getvalue()
+
+        # --- Capture "Ready to Send" Timestamp ---
+        # We capture this *after* all encoding/processing to simulate the start of network transmission.
+        # This allows us to simply add the SIM_ENC constant at the receiver for the total latency.
+        send_timestamp = time.time()
 
         message_dict = {
             'ts': send_timestamp,
@@ -408,10 +425,33 @@ from utils.models import PretrainedMobileNetEncoder # Import custom Encoder
             # Convert PIL image to bytes
             img_byte_arr = io.BytesIO()
             img.save(img_byte_arr, format='JPEG')
-            message_dict['payload'] = img_byte_arr.getvalue()
-            log_msg_type = "RAW"
+            
+            # --- SIMULATION HACK: Pad RAW payload ---
+            # To simulate high-res images (e.g. 50-150KB) so that Bandwidth actually matters.
+            # 150KB padding guarantees failure at 1Mbps (~1.2s delay > 1.0s deadline).
+            padding_size = 150 * 1024 # 150 KB
+            dummy_padding = b'\x00' * padding_size
+            
+            message_dict['payload'] = img_byte_arr.getvalue() + dummy_padding
+            log_msg_type = f"RAW (+{padding_size//1024}KB Pad)"
             
         return message_dict, log_msg_type
+
+    def _get_normalized_state(self, local_state, noise, bandwidth) -> np.ndarray:
+        """Combines and normalizes the state vector."""
+        # 1. Concatenate
+        network_state = np.array([noise, bandwidth], dtype=np.float32)
+        full_state = np.concatenate((local_state, network_state))
+        
+        # 2. Normalize (Simple Min-Max scaling using known High bounds)
+        # Avoid division by zero
+        high = np.maximum(self.state_high, 1e-6)
+        normalized_state = full_state / high
+        
+        # Clip to [0, 1] just in case
+        normalized_state = np.clip(normalized_state, 0.0, 1.0)
+        
+        return normalized_state
 
     def run(self):
         """
@@ -422,8 +462,11 @@ from utils.models import PretrainedMobileNetEncoder # Import custom Encoder
         
         # Initialize the 5D state
         local_state = self._get_local_state()
-        network_state = np.array([0.0, 10.0], dtype=np.float32)  # Initial guess
-        state = np.concatenate((local_state, network_state))
+        # network_state = np.array([0.0, 10.0], dtype=np.float32)  # Initial guess
+        # state = np.concatenate((local_state, network_state))
+        
+        # Use Normalized State
+        state = self._get_normalized_state(local_state, 0.05, 10.0)
 
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -431,17 +474,34 @@ from utils.models import PretrainedMobileNetEncoder # Import custom Encoder
                 s.connect((self.channel_host, self.channel_port))
                 logging.info("Connected to channel. Starting DRL loop.")
 
+                # --- Initialize CSV Logger ---
+                csv_file_path = "/app/runs/results.csv"
+                logging.info(f"Initializing results logger at {csv_file_path}")
+                try:
+                    # Create/Overwrite file and write header
+                    with open(csv_file_path, 'w', newline='') as f:
+                        writer = csv.writer(f)
+                        writer.writerow(['step', 'timestamp', 'cpu', 'mem', 'data_size', 'action', 'reward', 'noise', 'bandwidth', 'epsilon'])
+                except Exception as e:
+                    logging.error(f"Failed to create CSV logger: {e}")
+
+
                 for step in range(1, self.total_steps + 1):
                     
                     # 1. AGENT: Select Action
-                    action, _ = self.model.predict(state, deterministic=False)
+                    # Explicit Epsilon-Greedy Exploration
+                    if random.random() < self.epsilon:
+                        action = self.env.action_space.sample()
+                        # logging.info(f"Exploration: Random Action {action} selected.")
+                    else:
+                        action, _ = self.model.predict(state, deterministic=False)
                     
                     # 2. SENDER: Create and send message
                     message_dict, log_msg_type = self._create_message_payload(action)
                     message_payload_bytes = pickle.dumps(message_dict)
                     
                     logging.info(f"Step {step}: State={np.round(state, 2)}")
-                    logging.info(f"  -> Action Int: {action}, Epsilon: {getattr(self.model, 'exploration_rate', 'N/A')}")
+                    logging.info(f"  -> Action Int: {action}, Epsilon: {self.epsilon:.4f}")
                     logging.info(f"  -> Action Type: {log_msg_type}")
                     self._send_message(s, message_payload_bytes)
                     
@@ -451,11 +511,28 @@ from utils.models import PretrainedMobileNetEncoder # Import custom Encoder
                     except queue.Empty:
                         logging.warning("Feedback timeout! Skipping step.")
                         continue
+                    
+                    # --- Log to CSV ---
+                    try:
+                        with open(csv_file_path, 'a', newline='') as f:
+                            writer = csv.writer(f)
+                            # state = [cpu, mem, data_size, last_noise, last_bw]
+                            # We want CURRENT local state used for this action
+                            # We have 'local_state' variable from before loop or update?
+                            # Wait, state is [cpu, mem, data, net_noise, net_bw].
+                            
+                            # Let's extract from 'state' which was used for decision
+                            s_cpu = state[0]
+                            s_mem = state[1]
+                            s_data = state[2]
+                            
+                            writer.writerow([step, time.time(), s_cpu, s_mem, s_data, log_msg_type, reward, noise, bandwidth, self.epsilon])
+                    except Exception as e:
+                        logging.error(f"Error logging to CSV: {e}")
 
                     # 4. AGENT: Construct next_state and learn
                     next_local_state = self._get_local_state()
-                    next_network_state = np.array([noise, bandwidth], dtype=np.float32)
-                    next_state = np.concatenate((next_local_state, next_network_state))
+                    next_state = self._get_normalized_state(next_local_state, noise, bandwidth)
                     
                     # Add experience to replay buffer
                     self.model.replay_buffer.add(state, next_state, action, reward, done=False, infos=[{}])
@@ -466,10 +543,14 @@ from utils.models import PretrainedMobileNetEncoder # Import custom Encoder
                     # Train the agent
                     if step > self.learning_starts:
                         try:
-                            self.model.train(gradient_steps=1)
+                            self.model.train(gradient_steps=4)
                         except Exception as e:
                             logging.error(f"Error during model.train() at step {step}: {e}")
+                            logging.error(f"Error during model.train() at step {step}: {e}")
                             logging.error("Continuing without training for this step...")
+                    
+                    # Decay Epsilon
+                    self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
                     
                     if step % 100 == 0:
                         total_sent = self.semantic_local_count + self.raw_count + self.semantic_edge_count
