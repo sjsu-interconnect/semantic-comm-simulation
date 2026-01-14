@@ -3,4 +3,9 @@ torchvision
 numpy
 Pillow
 tensorboard
+tensorboard
 requests
+diffusers
+transformers
+accelerate
+scipy

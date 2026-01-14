@@ -5,4 +5,10 @@ psutil
 gymnasium
 stable-baselines3[extra]
 tensorboard
+stable-baselines3[extra]
+tensorboard
 requests
+diffusers
+transformers
+accelerate
+scipy

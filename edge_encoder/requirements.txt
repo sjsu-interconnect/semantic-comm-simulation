@@ -5,3 +5,8 @@ uvicorn
 python-multipart
 numpy
 Pillow
+requests
+diffusers
+transformers
+accelerate
+scipy

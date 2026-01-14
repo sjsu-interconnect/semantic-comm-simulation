@@ -15,6 +15,7 @@ venv/
 *.zip
 models/*.pth
 models/*.zip
+models/*.json
 runs/
 minibatch_*.pt
 

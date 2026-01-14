@@ -6,8 +6,9 @@ from PIL import Image
 import io
 import os
 import logging
-from utils.models import ComplexDecoder
+from utils.models import VAEWrapper
 import torchvision.transforms as transforms
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -20,23 +21,13 @@ decoder = None
 
 def load_model():
     global decoder
-    logger.info("Initializing Edge Decoder (Complex)...")
-    decoder = ComplexDecoder(encoded_space_dim=512)
+    logger.info("Initializing Edge Decoder (VAE)...")
+    decoder = VAEWrapper(device='cpu')
+
     
-    weights_path = "/app/models/complex_decoder.pth"
-    if os.path.exists(weights_path):
-        logger.info(f"Loading weights from {weights_path}...")
-        try:
-            state_dict = torch.load(weights_path, map_location='cpu')
-            # No prefix stripping needed for standalone decoder weights
-            decoder.load_state_dict(state_dict)
-            logger.info("Weights loaded successfully.")
-        except Exception as e:
-            logger.error(f"Failed to load weights: {e}")
-    else:
-        logger.warning("No weights found! Using random initialization.")
-    
-    decoder.eval()
+    # Removed legacy weight loading. VAE loads itself.
+
+
 
 @app.on_event("startup")
 async def startup_event():
@@ -50,14 +41,21 @@ async def decode_vector(payload: dict = Body(...)):
             return {"error": "No vector provided"}
             
         vector_np = np.array(vector_list, dtype=np.float32)
+        # Reshape if flat? VAE expects [B, 4, H, W]
+        # If EdgeEncoder sent nested list, we are good.
+        if vector_np.ndim == 1:
+            # Fallback reshape if flattened (4 * 32 * 32 = 4096)
+            vector_np = vector_np.reshape(4, 32, 32)
+            
         vector_t = torch.from_numpy(vector_np).unsqueeze(0) # Add batch dim
         
         with torch.no_grad():
-            reconstructed_img_t = decoder(vector_t)
-            # Output is [1, 3, 32, 32] in [0, 1]
+            reconstructed_img_t = decoder.decode(vector_t)
+            # Output is [1, 3, 256, 256] in [0, 1]
             
             # Convert to PIL Image
             img_t = reconstructed_img_t.squeeze(0)
+
             img_pil = transforms.ToPILImage()(img_t)
             
             # Save to bytes

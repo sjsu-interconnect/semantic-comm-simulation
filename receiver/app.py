@@ -1,8 +1,11 @@
 import socket
 import torch
 import torchvision.transforms as transforms
-from utils.models import SimpleDecoder # Import custom Decoder
+from utils.models import TinyVAEWrapper, VAEWrapper # Import TinyVAE + VAE
 from PIL import Image
+
+
+
 import os
 import numpy as np
 import time
@@ -31,14 +34,14 @@ DEFAULT_ALPHA_WEIGHT = 20.0
 DEFAULT_LATENCY_PENALTY_FACTOR = 2.0
 
 # --- SIMULATED TIMES (Seconds) ---
-SIM_ENC_SEMANTIC_LOCAL = 0.200 # Slow Mobile CPU
-SIM_ENC_SEMANTIC_EDGE = 0.020  # Fast Edge GPU
+SIM_ENC_SEMANTIC_LOCAL = 0.500 # Slow Mobile CPU (Increased to create trade-off)
+SIM_ENC_SEMANTIC_EDGE = 0.010  # Fast Edge GPU cluster
 SIM_ENC_RAW = 0.005
 
 SIM_DEC_SEMANTIC = 0.050
 SIM_DEC_RAW = 0.010
 
-EDGE_QUALITY_MULTIPLIER = 0.5 # Edge model is better, so 50% less loss
+EDGE_QUALITY_MULTIPLIER = 0.25 # Edge model is significantly better (75% less loss)
 RAW_NOISE_SENSITIVITY = 10.0 # RAW is very sensitive to noise (simulating packet corruption)
 
 
@@ -65,30 +68,24 @@ class Receiver:
         self.alpha_weight = alpha
         self.latency_penalty_factor = DEFAULT_LATENCY_PENALTY_FACTOR
 
-        # --- Initialize Decoder (Simple/Local) ---
-        logging.info("Initializing Custom Decoder (Simple/Local)...")
-        self.decoder = SimpleDecoder(encoded_space_dim=512)
+        # --- Initialize Decoders ---
+        # 1. Local Decoder (TinyVAE)
+        logging.info("Initializing TinyVAE Decoder (Local/Fast)...")
+        self.local_decoder = TinyVAEWrapper(device='cpu')
         
-        # Load pre-trained weights if available
-        ae_weights_path = "/app/models/simple_decoder.pth"
-        if os.path.exists(ae_weights_path):
-            logging.info(f"Loading SimpleDecoder weights from {ae_weights_path}...")
-            try:
-                state_dict = torch.load(ae_weights_path, map_location='cpu')
-                # No prefix stripping needed for standalone decoder weights
-                self.decoder.load_state_dict(state_dict)
-                logging.info("Decoder weights loaded successfully.")
-            except Exception as e:
-                logging.error(f"Failed to load decoder weights: {e}")
-        else:
-            logging.warning("No pre-trained weights found. Using random initialization.")
-        self.decoder.eval()
+        # 2. Edge Decoder (VAE)
+
+        logging.info("Initializing VAE Decoder (Edge/High Quality)...")
+        self.edge_decoder = VAEWrapper(device='cpu')
+
+
         
-        # Transform for GT image (to match Decoder output)
+        # Transform for GT image (to match VAE output 256x256)
         self.preprocess = transforms.Compose([
-            transforms.Resize((32, 32)),
+            transforms.Resize((256, 256)),
             transforms.ToTensor(), # Converts to [0, 1]
         ])
+
         
         # --- Knowledge Base Initialization ---
         # self.knowledge_base = self._create_knowledge_base() # Removed: We now receive GT vector
@@ -120,13 +117,45 @@ class Receiver:
             logging.error(f"Error calling Edge Decoder: {e}")
             return self._decode_vector(vector)
 
+    # Updated to distinguish Local vs Edge based on vector size is NO LONGER needed if they are same size
+    # But for backward compatibility or safety:
     def _decode_vector(self, vector: np.ndarray) -> torch.Tensor:
-        """Decodes the semantic vector into an image tensor."""
+        """Decodes vector using the local decoder (TinyVAE)."""
+        # If vector is flat (assuming TinyVAE latent flattened), reshape
+        # 4 * 32 * 32 = 4096
+        if vector.size == 4096:
+            vector = vector.reshape(4, 32, 32)
+        elif vector.size == 512:
+             logging.warning("Received 512-dim vector but expected TinyVAE latent. Fallback/Error specific.")
+             # Technically we changed Sender to send VAE latent now.
+             pass
+
+        return self._decode_local(vector)
+
+    def _decode_local(self, vector: np.ndarray) -> torch.Tensor:
+        """Decodes the latent tensor using TinyVAE."""
         with torch.no_grad():
-            # Vector is numpy, convert to tensor
-            z = torch.from_numpy(vector).float().unsqueeze(0) # Add batch dim
-            reconstructed_img = self.decoder(z)
-            return reconstructed_img.squeeze(0) # Remove batch dim -> [C, H, W]
+            # Vector [4, 32, 32]
+            if vector.ndim == 1: 
+                vector = vector.reshape(4, 32, 32)
+            z = torch.from_numpy(vector).float().unsqueeze(0) # [1, 4, 32, 32]
+            
+            # TinyVAE Decode
+            reconstructed_img = self.local_decoder.decode(z) # [1, 3, 256, 256]
+            return reconstructed_img.squeeze(0)
+
+
+    def _decode_vae_latent(self, vector: np.ndarray) -> torch.Tensor:
+        """Decodes the semantic latent tensor (VAE)."""
+        with torch.no_grad():
+            # Vector [4, 32, 32] or [4096]
+            if vector.ndim == 1:
+                vector = vector.reshape(4, 32, 32)
+            z = torch.from_numpy(vector).float().unsqueeze(0) # [1, 4, 32, 32]
+            reconstructed_img = self.edge_decoder.decode(z) # [1, 3, 256, 256]
+            return reconstructed_img.squeeze(0)
+
+
 
     def _get_image_feature_vector(self, image_path: str) -> np.ndarray:
         """Utility function to extract feature vector from a file path."""

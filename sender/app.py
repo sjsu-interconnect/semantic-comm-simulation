@@ -4,9 +4,13 @@ import random
 import os
 import torch
 import torchvision
+import torchvision
 import torchvision.transforms as transforms
-from utils.models import PretrainedMobileNetEncoder # Import custom Encoder
+from utils.models import TinyVAEWrapper # Local is now TinyVAE
 from PIL import Image
+
+
+
 import numpy as np
 import threading
 import struct
@@ -33,8 +37,6 @@ logging.basicConfig(level=logging.INFO,
 # --- CONFIGURATION CONSTANTS ---
 CHANNEL_HOST = 'channel'
 CHANNEL_PORT = 65431
-CHANNEL_HOST = 'channel'
-CHANNEL_PORT = 65431
 # IMAGE_DIR = '/app/images' # Removed in favor of CIFAR-10
 # IMAGE_FILENAMES = ['cat.jpeg', 'car.jpeg', 'dog.jpeg'] # Removed
 
@@ -52,8 +54,15 @@ ACTION_SEMANTIC_LOCAL = 0
 ACTION_RAW = 1
 ACTION_SEMANTIC_EDGE = 2
 
-STATE_SPACE_LOW = np.array([0.0, 0.0, 50.0, 0.0, 1.0], dtype=np.float32)
-STATE_SPACE_HIGH = np.array([100.0, 100.0, 2048.0, 0.5, 20.0], dtype=np.float32)
+ACTION_RAW = 1
+ACTION_SEMANTIC_EDGE = 2
+
+# VAE Latent: 4 * 32 * 32 = 4096 float32s. 
+# Data Size High = 4096 * 4 bytes / 1024 = 16 KB.
+# Let's adjust state space high for data size to 20KB.
+STATE_SPACE_LOW = np.array([0.0, 0.0, 1.0, 0.0, 1.0], dtype=np.float32)
+STATE_SPACE_HIGH = np.array([100.0, 100.0, 20.0, 0.5, 20.0], dtype=np.float32)
+
 
 
 # Default to 100,000 if not set
@@ -63,7 +72,7 @@ REPLAY_BUFFER_SIZE = 5000
 LEARNING_STARTS = 100
 TRAIN_FREQUENCY = 1
 TARGET_UPDATE_INTERVAL = 1000
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 1e-4 # Reduced from 1e-3 for stability
 
 # --- Dummy env to hold spaces (required by SB3) ---
 class DummyEnv(gym.Env):
@@ -186,7 +195,7 @@ class SenderAgent:
         # --- Exploration Config (Epsilon-Greedy) ---
         self.epsilon = 1.0
         self.epsilon_min = 0.05
-        self.epsilon_decay = 0.995
+        self.epsilon_decay = 0.9995 # Slower decay for better exploration
         
         # --- Thread-safe queue for feedback ---
         self.feedback_queue = queue.Queue()
@@ -198,30 +207,19 @@ class SenderAgent:
 
 
         # --- Initialize Feature Extractor (Encoder) ---
-        logging.info("Initializing Custom Encoder (MobileNetV3/Local)...")
-        # Use MobileNetV3 for local processing
-        self.feature_extractor = PretrainedMobileNetEncoder(encoded_space_dim=512)
+        logging.info("Initializing TinyVAE Encoder (Local/Fast)...")
+        # Use TinyVAE for local processing (Fast, 256x256)
+        self.feature_extractor = TinyVAEWrapper(device='cpu')
         
-        # Load pre-trained weights if available
-        ae_weights_path = "/app/models/mobilenet_encoder.pth"
-        if os.path.exists(ae_weights_path):
-            logging.info(f"Loading MobileNet weights from {ae_weights_path}...")
-            try:
-                state_dict = torch.load(ae_weights_path, map_location='cpu')
-                # No prefix issues this time, we save state_dict directly from model
-                self.feature_extractor.load_state_dict(state_dict)
-                logging.info("Encoder weights loaded successfully.")
-            except Exception as e:
-                logging.error(f"Failed to load encoder weights: {e}")
-        else:
-            logging.warning("No pre-trained weights found. Using random/imagenet weights.")
-
-        # IMPORTANT: MobileNet expects 224x224
+        # Preprocessing for TinyVAE (Resize to 256x256)
         self.feature_extractor.eval()
         self.preprocess = transforms.Compose([
-            transforms.Resize((224, 224)), # Resize for MobileNet
+            transforms.Resize((256, 256)), 
             transforms.ToTensor(),
         ])
+
+
+
 
         # --- Initialize Dataset ---
         dataset_type = 'CIFAR10'
@@ -247,10 +245,11 @@ class SenderAgent:
                     self.model.buffer_size,
                     dummy_env.observation_space,
                     dummy_env.action_space,
-                    self.model.device,
                     n_envs=1,
                     optimize_memory_usage=False
                 )
+            # Load metadata (epsilon, steps)
+            self._load_metadata(load_model_path)
         else:
             self.model = DQN(
                 "MlpPolicy",
@@ -280,17 +279,62 @@ class SenderAgent:
         new_logger = configure("/app/runs/sender_logs", ["stdout", "tensorboard"])
         self.model.set_logger(new_logger)
 
+    def _save_metadata(self, filename: str, step: int):
+        """Saves agent metadata (epsilon, step) to a sidecar JSON file."""
+        metadata = {
+            'step': step,
+            'epsilon': self.epsilon
+        }
+        try:
+            with open(f"{filename}.json", 'w') as f:
+                json.dump(metadata, f)
+            logging.info(f"Saved metadata to {filename}.json")
+        except Exception as e:
+            logging.error(f"Failed to save metadata: {e}")
+
+    def _load_metadata(self, model_name: str):
+        """Loads agent metadata from sidecar JSON if it exists."""
+        meta_path = f"/app/models/{model_name}.json"
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path, 'r') as f:
+                    metadata = json.load(f)
+                
+                # Restore epsilon
+                if 'epsilon' in metadata:
+                    self.epsilon = float(metadata['epsilon'])
+                    logging.info(f"Restored Epsilon: {self.epsilon:.4f}")
+                
+                # NOTE: We generally don't restore 'step' to overwrite self.total_steps loop,
+                # because we often want to run *more* steps. But we could use it for logging offset.
+            except Exception as e:
+                logging.error(f"Failed to load metadata from {meta_path}: {e}")
+        else:
+            logging.warning(f"No metadata file found at {meta_path}. Using default/e_min parameters.")
+            # If loading a model but no metadata, assume we are continuing training, so drop epsilon
+            if self.epsilon == 1.0: 
+                 self.epsilon = 0.5 # Conservative start if file missing but model loaded
+
+
     def _get_image_feature_vector(self, img: Image.Image) -> np.ndarray:
-        """Extracts feature vector from a PIL Image using the Encoder."""
+        """Extracts latent tensor from a PIL Image using TinyVAE."""
         # Ensure image is RGB
         img = img.convert('RGB')
         img_t = self.preprocess(img)
         batch_t = torch.unsqueeze(img_t, 0)
         with torch.no_grad():
-            # Encoder returns flattened vector
-            vector = self.feature_extractor(batch_t)
-            vector = vector.squeeze().numpy()
+            # Encoder returns latent tensor [1, 4, 32, 32]
+            latent = self.feature_extractor.encode(batch_t)
+            if latent is not None:
+                # TinyVAE latent usually matches SD scale, but TAESD native output might differ slightly 
+                # depending on exact weights. Assuming madebyollin/taesd matches SD.
+                vector = latent.squeeze(0).cpu().numpy() # [4, 32, 32]
+            else:
+                vector = np.zeros((4, 32, 32), dtype=np.float32)
         return vector
+
+
+
 
     def _reward_listener_thread(self):
         """
@@ -353,8 +397,10 @@ class SenderAgent:
             
             if response.status_code == 200:
                 data = response.json()
+                # Expecting list or base64? New logic returns 'vector' (latent)
                 vector = np.array(data['vector'], dtype=np.float32)
                 return vector
+
             else:
                 logging.error(f"Edge Encoder failed: {response.text}")
                 # Fallback to local encoder or random?
@@ -470,8 +516,22 @@ class SenderAgent:
 
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                logging.info(f"Connecting to channel at {self.channel_host}:{self.channel_port}...")
-                s.connect((self.channel_host, self.channel_port))
+                # Retry logic for connection
+                connected = False
+                for i in range(10):
+                    try:
+                        logging.info(f"Connecting to channel at {self.channel_host}:{self.channel_port} (Attempt {i+1}/10)...")
+                        s.connect((self.channel_host, self.channel_port))
+                        connected = True
+                        break
+                    except socket.error as e:
+                        logging.warning(f"Connection failed: {e}. Retrying in 2 seconds...")
+                        time.sleep(2)
+                
+                if not connected:
+                    logging.error("Could not connect to channel after 10 attempts. Exiting.")
+                    return
+
                 logging.info("Connected to channel. Starting DRL loop.")
 
                 # --- Initialize CSV Logger ---
@@ -543,7 +603,8 @@ class SenderAgent:
                     # Train the agent
                     if step > self.learning_starts:
                         try:
-                            self.model.train(gradient_steps=4)
+                            # Gradient Steps = 1 for stability (was 4)
+                            self.model.train(gradient_steps=1)
                         except Exception as e:
                             logging.error(f"Error during model.train() at step {step}: {e}")
                             logging.error(f"Error during model.train() at step {step}: {e}")
@@ -560,7 +621,11 @@ class SenderAgent:
                         
                         logging.info(f"--- Step {step}, Last Reward: {reward:.3f} ---")
                         logging.info(f"--- Stats: Total={total_sent}, LOCAL={self.semantic_local_count} ({sem_local_pct:.1f}%), EDGE={self.semantic_edge_count} ({sem_edge_pct:.1f}%), RAW={self.raw_count} ({raw_pct:.1f}%) ---")
-                        self.model.save(f"/app/models/drl_agent_checkpoint_{step}")
+                        
+                        # Save checkpoint and metadata
+                        ckpt_path = f"/app/models/drl_agent_checkpoint_{step}"
+                        self.model.save(ckpt_path)
+                        self._save_metadata(ckpt_path, step)
 
         except socket.error as e:
             logging.error(f"Socket error in main loop: {e}. Exiting.")
@@ -576,8 +641,12 @@ class SenderAgent:
             logging.info(f"=== FINAL STATS === Total Steps: {total_sent}")
             logging.info(f"=== LOCAL: {self.semantic_local_count} ({sem_local_pct:.1f}%)")
             logging.info(f"=== EDGE: {self.semantic_edge_count} ({sem_edge_pct:.1f}%)")
+            logging.info(f"=== EDGE: {self.semantic_edge_count} ({sem_edge_pct:.1f}%)")
             logging.info(f"=== RAW: {self.raw_count} ({raw_pct:.1f}%)")
-            self.model.save("/app/models/drl_agent_final")
+            
+            final_path = "/app/models/drl_agent_final"
+            self.model.save(final_path)
+            self._save_metadata(final_path, self.total_steps)
 
 if __name__ == "__main__":
     agent = SenderAgent()

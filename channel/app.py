@@ -57,22 +57,24 @@ class DynamicChannel:
         """
         logging.info("Dynamic state update thread started.")
         while True:
-            noise_change = random.uniform(-0.01, 0.01)
+            noise_change = random.uniform(-0.1, 0.1)
             self.current_noise = np.clip(self.current_noise + noise_change, 0.0, 0.5)
             
-            bw_change = random.uniform(-1.0, 1.0)
+            bw_change = random.uniform(-5.0, 5.0)
             self.current_bandwidth = np.clip(self.current_bandwidth + bw_change, 1.0, 20.0)
             
-            time.sleep(3) # Update state every 3 seconds
+            time.sleep(1) # Update state every 1 second
 
     def add_noise(self, vector: np.ndarray) -> np.ndarray:
         """
         Applies Gaussian noise to a numpy vector based on the current noise level.
         """
         try:
-            if vector.shape[0] != self.vector_size:
-                logging.warning(f"Noise] Error: Expected vector size {self.vector_size}, got {vector.shape[0]}")
-                return vector
+            # Removed strict size check to allow for different vector sizes (512 vs 4x32x32)
+            # if vector.shape[0] != self.vector_size:
+            #    logging.warning(f"Noise] Error: Expected vector size {self.vector_size}, got {vector.shape[0]}")
+            #    return vector
+
             
             noise = np.random.normal(0, self.current_noise, vector.shape)
             noisy_vector = vector + noise

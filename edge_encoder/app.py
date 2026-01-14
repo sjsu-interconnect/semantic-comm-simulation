@@ -5,8 +5,9 @@ from PIL import Image
 import io
 import os
 import logging
-from utils.models import PretrainedResNetEncoder
+from utils.models import VAEWrapper
 import torchvision.transforms as transforms
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -20,28 +21,19 @@ preprocess = None
 
 def load_model():
     global encoder, preprocess
-    logger.info("Initializing Edge Encoder (ResNet50/Edge)...")
-    encoder = PretrainedResNetEncoder(encoded_space_dim=512)
+    logger.info("Initializing Edge Encoder (VAE)...")
+    encoder = VAEWrapper(device='cpu')
+
     
-    weights_path = "/app/models/resnet_encoder.pth"
-    if os.path.exists(weights_path):
-        logger.info(f"Loading weights from {weights_path}...")
-        try:
-            state_dict = torch.load(weights_path, map_location='cpu')
-            encoder.load_state_dict(state_dict)
-            logger.info("Weights loaded successfully.")
-        except Exception as e:
-            logger.error(f"Failed to load weights: {e}")
-    else:
-        logger.warning("No weights found! Using random/imagenet initialization.")
+    # Removed legacy ResNet weight loading. VAE loads itself.
+
     
-    encoder.eval()
-    
-    # ResNet expects 224x224
+    # Resize to 256x256 for VAE
     preprocess = transforms.Compose([
-        transforms.Resize((224, 224)), 
+        transforms.Resize((256, 256)), 
         transforms.ToTensor(),
     ])
+
 
 @app.on_event("startup")
 async def startup_event():
@@ -59,8 +51,24 @@ async def encode_image(file: UploadFile = File(...)):
         batch_t = torch.unsqueeze(img_t, 0)
         
         with torch.no_grad():
-            vector = encoder(batch_t)
-            vector_np = vector.squeeze().numpy().tolist()
+
+            # encoder.encode returns latent [1, 4, 32, 32] (assuming 256x256 in)
+            latent = encoder.encode(batch_t)
+            vector_np = latent.squeeze().flatten().tolist() # Flatten for JSON transport?
+            # Or keep as nested list? Receiver expects numpy array constructable from list.
+            # Flattening is safest for JSON logic, but Receiver needs to reshape.
+            # Sender sends pure bytes for SEM_EDGE, wait.
+            # Sender: _get_edge_feature_vector
+            #   response.json()['vector'] -> vector = np.array(data['vector'])
+            #   If we flatten here, sender gets flat array.
+            #   Sender then creates payload. Receiver gets flat array.
+            #   Receiver: _decode_edge_vector -> sends vector to Edge Decoder.
+            #   Receiver: _decode_vector -> Reshapes to (4, 32, 32).
+            #   Wait, Sender VAE returns (4,32,32).
+            #   Edge Encoder JSON must be consistent.
+            #   Let's keep it nested list: latent.squeeze().tolist() -> 4x32x32 list.
+            vector_np = latent.squeeze().tolist() 
+
             
         return {"vector": vector_np}
     except Exception as e:
