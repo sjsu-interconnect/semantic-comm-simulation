@@ -274,11 +274,18 @@ class SenderAgent:
                 optimize_memory_usage=False
             )
         
-        # FIX: Manually configure logger to avoid '_logger' or 'logger' attribute errors during manual train() calls
-        from stable_baselines3.common.logger import configure
-        new_logger = configure("/app/runs/sender_logs", ["stdout", "tensorboard"])
-        self.model.set_logger(new_logger)
 
+        # --- Generate Unique Run ID ---
+        import datetime
+        self.run_id = datetime.datetime.now().strftime("run_%Y%m%d_%H%M%S")
+        self.run_dir = f"/app/runs/{self.run_id}"
+        os.makedirs(self.run_dir, exist_ok=True)
+        logging.info(f"Initialized Run Directory: {self.run_dir}")
+        
+        # --- Configure Loggers ---
+        from stable_baselines3.common.logger import configure
+        new_logger = configure(f"{self.run_dir}/sender_logs", ["stdout", "tensorboard"])
+        self.model.set_logger(new_logger)
     def _save_metadata(self, filename: str, step: int):
         """Saves agent metadata (epsilon, step) to a sidecar JSON file."""
         metadata = {
@@ -349,16 +356,23 @@ class SenderAgent:
                 try:
                     conn, addr = s.accept()
                     with conn:
-                        data = conn.recv(12)  # 3 floats * 4 bytes/float
-                        if not data or len(data) != 12:
-                            logging.warning(f"[Feedback] Incomplete data (got {len(data)} bytes).")
+                        # Expecting 5 floats (20 bytes): [reward, noise, bandwidth, latency, mse]
+                        # But handle legacy 12 bytes gracefully if possible? No, we updated Receiver.
+                        data = conn.recv(20) 
+                        
+                        if not data:
                             continue
-                        
-                        feedback_data = np.frombuffer(data, dtype=np.float32)
-                        reward, noise, bandwidth = feedback_data
-                        
-                        # Put the full tuple into the queue
-                        self.feedback_queue.put((reward, noise, bandwidth))
+                            
+                        if len(data) == 20:
+                            feedback_data = np.frombuffer(data, dtype=np.float32)
+                            reward, noise, bandwidth, latency, mse = feedback_data
+                            self.feedback_queue.put((reward, noise, bandwidth, latency, mse))
+                        elif len(data) == 12:
+                            feedback_data = np.frombuffer(data, dtype=np.float32)
+                            reward, noise, bandwidth = feedback_data
+                            self.feedback_queue.put((reward, noise, bandwidth, 0.0, 0.0))
+                        else:
+                            logging.warning(f"[Feedback] Incomplete data (got {len(data)} bytes).")
                         
                 except Exception as e:
                     logging.error(f"Error in feedback listener: {e}")
@@ -438,13 +452,8 @@ class SenderAgent:
         img.save(img_byte_arr, format='JPEG')
         gt_image_bytes = img_byte_arr.getvalue()
 
-        # --- Capture "Ready to Send" Timestamp ---
-        # We capture this *after* all encoding/processing to simulate the start of network transmission.
-        # This allows us to simply add the SIM_ENC constant at the receiver for the total latency.
-        send_timestamp = time.time()
-
         message_dict = {
-            'ts': send_timestamp,
+            # 'ts': assigned at end of function
             'label': label,
             'gt_image': gt_image_bytes # Send GT Image for reconstruction loss
         }
@@ -480,6 +489,11 @@ class SenderAgent:
             
             message_dict['payload'] = img_byte_arr.getvalue() + dummy_padding
             log_msg_type = f"RAW (+{padding_size//1024}KB Pad)"
+            
+        # --- Update Timestamp JUST BEFORE RETURN --- 
+        # This ensures we don't count the local/edge processing time (overhead) in the network latency.
+        # The receiver will add the simulated encoding time (SIM_ENC_*) explicitly.
+        message_dict['ts'] = time.time()
             
         return message_dict, log_msg_type
 
@@ -535,13 +549,13 @@ class SenderAgent:
                 logging.info("Connected to channel. Starting DRL loop.")
 
                 # --- Initialize CSV Logger ---
-                csv_file_path = "/app/runs/results.csv"
+                csv_file_path = f"{self.run_dir}/results.csv"
                 logging.info(f"Initializing results logger at {csv_file_path}")
                 try:
                     # Create/Overwrite file and write header
                     with open(csv_file_path, 'w', newline='') as f:
                         writer = csv.writer(f)
-                        writer.writerow(['step', 'timestamp', 'cpu', 'mem', 'data_size', 'action', 'reward', 'noise', 'bandwidth', 'epsilon'])
+                        writer.writerow(['step', 'timestamp', 'cpu', 'mem', 'data_size', 'action', 'reward', 'noise', 'bandwidth', 'epsilon', 'latency', 'mse'])
                 except Exception as e:
                     logging.error(f"Failed to create CSV logger: {e}")
 
@@ -565,30 +579,39 @@ class SenderAgent:
                     logging.info(f"  -> Action Type: {log_msg_type}")
                     self._send_message(s, message_payload_bytes)
                     
+
                     # 3. SENDER: Receive Feedback
                     try:
-                        reward, noise, bandwidth = self.feedback_queue.get(timeout=60.0)
+                        # Expecting: [reward, noise, bandwidth, latency, mse]
+                        feedback_data = self.feedback_queue.get(timeout=60.0)
+                        if len(feedback_data) == 5:
+                            reward, noise, bandwidth, latency, mse = feedback_data
+                        elif len(feedback_data) == 3:
+                             # Backward compatibility
+                             reward, noise, bandwidth = feedback_data
+                             latency, mse = 0.0, 0.0
+                        else:
+                             logging.error(f"Invalid feedback length: {len(feedback_data)}")
+                             continue
+                             
                     except queue.Empty:
                         logging.warning("Feedback timeout! Skipping step.")
                         continue
-                    
+                        
                     # --- Log to CSV ---
                     try:
                         with open(csv_file_path, 'a', newline='') as f:
                             writer = csv.writer(f)
-                            # state = [cpu, mem, data_size, last_noise, last_bw]
-                            # We want CURRENT local state used for this action
-                            # We have 'local_state' variable from before loop or update?
-                            # Wait, state is [cpu, mem, data, net_noise, net_bw].
-                            
-                            # Let's extract from 'state' which was used for decision
-                            s_cpu = state[0]
-                            s_mem = state[1]
-                            s_data = state[2]
-                            
-                            writer.writerow([step, time.time(), s_cpu, s_mem, s_data, log_msg_type, reward, noise, bandwidth, self.epsilon])
+                            # Columns: step, timestamp, cpu, mem, data_size, action, reward, noise, bandwidth, epsilon, latency, mse
+                            data_size_kb = len(message_payload_bytes) / 1024.0
+                            writer.writerow([step, time.time(), 0.0, 0.0, data_size_kb, log_msg_type, reward, noise, bandwidth, self.epsilon, latency, mse])
+                            f.flush() # Force flush
+                            # print(f"DEBUG: Wrote step {step} to CSV")
                     except Exception as e:
-                        logging.error(f"Error logging to CSV: {e}")
+                        logging.error(f"CSV append failed: {e}")
+                        print(f"DEBUG: CSV append exception: {e}")
+                    
+
 
                     # 4. AGENT: Construct next_state and learn
                     next_local_state = self._get_local_state()
@@ -623,7 +646,7 @@ class SenderAgent:
                         logging.info(f"--- Stats: Total={total_sent}, LOCAL={self.semantic_local_count} ({sem_local_pct:.1f}%), EDGE={self.semantic_edge_count} ({sem_edge_pct:.1f}%), RAW={self.raw_count} ({raw_pct:.1f}%) ---")
                         
                         # Save checkpoint and metadata
-                        ckpt_path = f"/app/models/drl_agent_checkpoint_{step}"
+                        ckpt_path = f"{self.run_dir}/drl_agent_checkpoint_{step}"
                         self.model.save(ckpt_path)
                         self._save_metadata(ckpt_path, step)
 
@@ -641,10 +664,9 @@ class SenderAgent:
             logging.info(f"=== FINAL STATS === Total Steps: {total_sent}")
             logging.info(f"=== LOCAL: {self.semantic_local_count} ({sem_local_pct:.1f}%)")
             logging.info(f"=== EDGE: {self.semantic_edge_count} ({sem_edge_pct:.1f}%)")
-            logging.info(f"=== EDGE: {self.semantic_edge_count} ({sem_edge_pct:.1f}%)")
             logging.info(f"=== RAW: {self.raw_count} ({raw_pct:.1f}%)")
             
-            final_path = "/app/models/drl_agent_final"
+            final_path = f"{self.run_dir}/drl_agent_final"
             self.model.save(final_path)
             self._save_metadata(final_path, self.total_steps)
 

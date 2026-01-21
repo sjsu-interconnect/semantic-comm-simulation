@@ -31,10 +31,10 @@ DEFAULT_SENDER_FEEDBACK_PORT = 65500
 DEFAULT_LATENCY_DEADLINE_TAU = 1.0
 DEFAULT_MISSED_DEADLINE_PENALTY = 10.0
 DEFAULT_ALPHA_WEIGHT = 20.0
-DEFAULT_LATENCY_PENALTY_FACTOR = 2.0
+DEFAULT_LATENCY_PENALTY_FACTOR = 5.0  # Increased to punish latency more severely
 
 # --- SIMULATED TIMES (Seconds) ---
-SIM_ENC_SEMANTIC_LOCAL = 0.500 # Slow Mobile CPU (Increased to create trade-off)
+SIM_ENC_SEMANTIC_LOCAL = 0.800 # Very Slow Mobile CPU (Almost deadline) 
 SIM_ENC_SEMANTIC_EDGE = 0.010  # Fast Edge GPU cluster
 SIM_ENC_RAW = 0.005
 
@@ -190,6 +190,9 @@ class Receiver:
 
     def _calculate_reward(self, semantic_loss: float, latency: float) -> float:
         """Calculates the reward based on loss and latency."""
+        self.last_step_latency = latency
+        self.last_step_loss = semantic_loss
+
         latency_met = latency <= self.deadline_tau
         
         # Binary Penalty for missing deadline
@@ -206,7 +209,9 @@ class Receiver:
             logging.info(f"Sending feedback to {self.sender_host}:{self.feedback_port} -> Reward: {reward:.4f}")
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as feedback_sock:
                 feedback_sock.connect((self.sender_host, self.feedback_port))
-                feedback_payload = np.array([reward, noise, bandwidth], dtype=np.float32)
+                # Payload: [reward, noise, bandwidth, latency, semantic_loss]
+                # If semantic_loss is locally None (e.g. Raw), use 0.0 or keep it as computed (Raw has 0 loss usually)
+                feedback_payload = np.array([reward, noise, bandwidth, self.last_step_latency, self.last_step_loss], dtype=np.float32)
                 feedback_sock.sendall(feedback_payload.tobytes())
             logging.info("Feedback sent successfully.")
         except socket.error as e:
@@ -435,7 +440,7 @@ class Receiver:
                 self.writer.add_image("Images/GroundTruth", gt_image, self.step_counter)
 
         logging.info(f"Received {log_msg_type} for: {original_label}")
-        logging.info(f"Latency: {total_latency:.4f}s")
+        logging.info(f"Latency Breakdown: Net={network_latency:.4f}s, SimEnc={sim_enc_time}s, Total={total_latency:.4f}s")
         logging.info(f"Reconstruction Loss (MSE): {reconstruction_loss:.4f}")
         logging.info(f"Network State: (Noise: {observed_noise:.3f}, BW: {observed_bandwidth:.2f})")
         logging.info(f"Calculated Reward: {reward:.4f}")
