@@ -69,6 +69,55 @@ The channel is configured to be **Aggressive**:
 *   **Policy**: Epsilon-Greedy (Exploration $\epsilon$ decays from 1.0 to 0.05).
 *   **Steps**: 5000 - 10,000 steps.
 
+### 3.4 DRL Agent Specification
+The agent uses a **Deep Q-Network (DQN)** implemented via *Stable Baselines3*.
+
+#### 3.4.1 State Space
+The agent observes a 5-dimensional normalized state vector $S_t = [s_1, s_2, s_3, s_4, s_5]$:
+1.  **CPU Usage** ($s_1$): Local device load $[0, 100\%]$.
+2.  **Memory Usage** ($s_2$): Local memory load $[0, 100\%]$.
+3.  **Data Size** ($s_3$): Approximate payload size scale $[1, 20]$.
+4.  **Channel Noise** ($s_4$): Packet corruption probability $[0.0, 0.5]$.
+5.  **Bandwidth** ($s_5$): Available throughput $[1.0, 20.0]$ Mbps.
+
+#### 3.4.2 Hyperparameters
+| Parameter | Value | Description |
+| :--- | :--- | :--- |
+| **Model Architecture** | `MlpPolicy` | Multi-Layer Perceptron (2 layers of 64 units). |
+| **Learning Rate** | `1e-4` | Reduced from standard `1e-3` for stability. |
+| **Batch Size** | `32` | Number of experiences sampled per update. |
+| **Replay Buffer** | `5000` | Size of experience memory (FIFO). |
+| **Gamma ($\gamma$)** | `0.99` | Future reward discount factor. |
+| **Epsilon Decay** | `0.9995` | Slow decay from 1.0 to 0.05 (Exploration). |
+| **Target Update** | `1000` | Steps between updating the Target Q-Network. |
+
+### 3.5 Latency Analysis and Justification
+
+The simulation calculates **Total Latency** ($L_{total}$) as the sum of three distinct components:
+$$ L_{total} = L_{enc} + L_{net} + L_{dec} $$
+
+#### 3.5.1 Computational Latency ($L_{enc}, L_{dec}$)
+We utilize **Simulated Injection** for computational latency to ensure reproducibility and to model specific hardware profiles regardless of the host machine's power.
+
+| Component | Simulated Time | Hardware Profile Modeled | Justification |
+| :--- | :--- | :--- | :--- |
+| **Local Inference (TinyVAE)** | **0.800s** | IoT Device / Raspberry Pi 4 (CPU) | Deep Neural Networks (DNN) on edge CPUs are compute-intensive. Benchmarks (e.g., *MLPerf Mobile*) show that ResNet-50 class models on mid-range mobile CPUs typically take **100-500ms**. We simulated a slightly heavier load (0.8s) to represent a strictly constrained environment where AI inference pushes the device to its thermal/Deadline limits. |
+| **Edge Inference (VAE)** | **0.010s** | NVIDIA A100 / V100 GPU | Server-grade GPUs provide massive parallelism. Inference for a 256x256 image on a modern GPU is typically **< 10ms** (excluding network). This represents the "ideal" offloading target. **Note**: This value assumes the Edge Server is a local MEC node connected via high-speed fiber/LAN, meaning the RTT to offload the image is negligible compared to the wireless backhaul. |
+| **RAW Preprocessing** | **0.005s** | Memory Copy | No heavy computation is involved, only memory mapping and I/O. |
+
+#### 3.5.2 Network Latency ($L_{net}$)
+Network latency is not a constant; it is physically simulated by the **Channel** service based on the payload size and dynamic bandwidth:
+$$ L_{net} = \frac{\text{Payload Size (bits)}}{\text{Bandwidth (bits/sec)}} + \text{Jitter} $$
+
+*   **Impact of Image Size**:
+    *   **RAW Image**: ~150 KB ($1.2 \times 10^6$ bits). At 10 Mbps, transmission takes **0.12s**. At 1 Mbps, it takes **1.2s** (exceeding the deadline).
+    *   **Semantic Vector**: ~17 KB ($1.3 \times 10^5$ bits). At 1 Mbps, transmission takes **0.13s**.
+    
+*   **Measurement**: The system measures $T_{recv} - T_{send}$ using precise timestamps.
+    *   *Correction*: The sender captures $T_{send}$ **after** local processing is complete, ensuring $L_{net}$ isolates only the transmission delay. 
+
+This model validates the core hypothesis: **Semantic Communication saves time primarily by reducing Payload Size**, allowing it to survive in low-bandwidth conditions where RAW transmission physically cannot meet the deadline.
+
 ---
 
 ## 4. Results
@@ -100,6 +149,16 @@ Initial experiments showed Edge performing poorly (-15 reward). Detailed debuggi
 
 ### 5.2 Robustness vs Optimality
 The agent demonstrates risk-averse behavior. Even when Bandwidth is "Good" (e.g., 8 Mbps), it often prefers Edge over RAW. While RAW might offer theoretically zero MSE, the risk of a sudden bandwidth drop causing a deadline miss (Penalty -10) outweighs the marginal quality gain. This is a desirable property for reliable safety-critical systems.
+
+### 5.3 Limitations and Future Work
+
+#### 5.3.1 Internet/Cloud Latency
+The current model assumes a **Mobile Edge Computing (MEC)** architecture, where the inference server is co-located with the base station (negligible backhaul RTT). Future iterations could model a **Cloud Offloading** scenario by introducing a separate stochastic variable $L_{internet}$ (e.g., $100ms \pm 20ms$) to represent the backhaul delay to a centralized data center.
+
+#### 5.3.2 Dynamic Resolution Scaling
+This simulation uses a fixed input resolution ($256 \times 256$) for all semantic actions, allowing for valid use of constant processing time estimates ($\text{Simulated Time}$). Real-world systems might dynamically adjust input resolution. In such cases, the processing latency would need to be modeled as a linear function of pixel count:
+$$ L_{process} = C_{base} + K \times (Width \times Height) $$
+Implementing this dynamic scaling is a planned enhancement for future work.
 
 ---
 

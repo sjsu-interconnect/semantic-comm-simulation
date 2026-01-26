@@ -15,7 +15,7 @@ graph TD
     subgraph Sender_Node [IoT Device / Sender]
         style Sender_Node fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
         Sender_Agent[DQN Agent]
-        TinyVAE[TinyVAE Encoder<br/>(Local)]
+        TinyVAE["TinyVAE Encoder<br/>(Local)"]
         
         Sender_Agent -- Selects Action --> Action_Decision{"Action?"}
         Action_Decision -- "SEM_LOCAL (0)" --> TinyVAE
@@ -29,8 +29,8 @@ graph TD
 
     subgraph Edge_Node [Edge Server]
         style Edge_Node fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
-        Edge_Service_Enc[Edge Encoder<br/>(Stable Diffusion VAE)]
-        Edge_Service_Dec[Edge Decoder<br/>(Stable Diffusion VAE)]
+        Edge_Service_Enc["Edge Encoder<br/>(Stable Diffusion VAE)"]
+        Edge_Service_Dec["Edge Decoder<br/>(Stable Diffusion VAE)"]
         
         Edge_Service_Enc -- "Latent Vector" --> Edge_Client
     end
