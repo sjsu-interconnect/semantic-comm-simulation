@@ -58,11 +58,19 @@ To ensure reproducibility and isolate network effects from Docker container perf
 
 > **Critical Implementation Detail**: The Sender captures the `send_timestamp` **after** the encoding phase (preprocessing). This ensures that "Network Latency" strictly measures the transmission time, while the Receiver adds the fixed "Simulated Processing Time" constants. This solved an initial issue where slow Docker CPU inference (1.2s) was incorrectly penalizing the Edge action.
 
-### 3.2 Channel Dynamics
-The channel is configured to be **Aggressive**:
-*   **Bandwidth**: Fluctuates randomly between **1 Mbps** and **20 Mbps**.
-*   **Noise**: Fluctuates between **0.0** (Clean) and **0.5** (High interference).
-*   Update Interval: 1.0s.
+### 3.2 Channel Dynamics & Environment Model
+The channel is configured to model a **Dynamic Wireless Edge Environment** (e.g., LTE/5G Cell Edge).
+
+#### 3.2.1 State Space Ranges & Justification
+| State Variable | Range | Modeled Scenario | Justification / Reference |
+| :--- | :--- | :--- | :--- |
+| **Bandwidth** | **1.0 - 20.0 Mbps** | **LTE Cell Edge to Average 4G** | According to *OpenSignal* and *Cisco VNI* reports, real-world cellular upload speeds at the cell edge often drop to 1-2 Mbps, while average 4G/LTE conditions provide 10-20 Mbps. This range captures the critical transition where RAW transmission becomes infeasible. |
+| **Channel Noise ($\sigma$)** | **0.0 - 0.5** | **Signal-to-Noise Ratio (SNR)** | Modeled as Additive White Gaussian Noise (AWGN). $\sigma=0.5$ corresponds to a low SNR environment (severe interference), common in industrial IoT or urban environments, affecting analog signal integrity. |
+| **Data Size Scale** | **1.0 - 20.0** | **Payload Variation** | Represents the fluctuation in payload size (e.g., Semantic Vector ~17KB vs RAW ~150KB). |
+
+#### 3.2.2 Dynamic Evolution
+The environment allows for continuous state evolution:
+*   **Update Interval**: 1.0s.
 
 ### 3.3 Training
 *   **Algorithm**: Deep Q-Network (DQN) with Experience Replay.
@@ -91,6 +99,15 @@ The agent observes a 5-dimensional normalized state vector $S_t = [s_1, s_2, s_3
 | **Epsilon Decay** | `0.9995` | Slow decay from 1.0 to 0.05 (Exploration). |
 | **Target Update** | `1000` | Steps between updating the Target Q-Network. |
 
+#### 3.4.3 State Transition Dynamics
+It is critical to note that the environment dynamics are **Stochastic and Independent**.
+*   **State Observation**: At step $t$, the agent observes state $S_t$ (current CPU, Bandwidth, Noise).
+*   **Action Execution**: The agent executes action $A_t$ (e.g., Send EDGE).
+*   **Next State ($S_{t+1}$)**: The next state is **NOT** a direct result of action $A_t$. Instead, the Channel evolves independently (via a Random Walk process) while the packet is in transit.
+    *   $S_{t+1}^{bandwidth} = S_t^{bandwidth} + \Delta_{random}$
+    *   $S_{t+1}^{noise} = S_t^{noise} + \Delta_{random}$
+*   **Implication**: The agent cannot "control" the bandwidth. It must learn to **anticipate** volatility. For example, if $S_t$ is "Good", the agent learns that $S_{t+1}$ might realistically be "Bad" (due to high volatility) and thus might behave conservatively (avoiding RAW) even in good conditions.
+
 ### 3.5 Latency Analysis and Justification
 
 The simulation calculates **Total Latency** ($L_{total}$) as the sum of three distinct components:
@@ -106,9 +123,12 @@ We utilize **Simulated Injection** for computational latency to ensure reproduci
 | **RAW Preprocessing** | **0.005s** | Memory Copy | No heavy computation is involved, only memory mapping and I/O. |
 
 #### 3.5.2 Network Latency ($L_{net}$)
-Network latency is not a constant; it is physically simulated by the **Channel** service based on the payload size and dynamic bandwidth:
+Network latency is physically simulated by the **Channel** service based on payload size, dynamic bandwidth, and random jitter:
 $$ L_{net} = \frac{\text{Payload Size (bits)}}{\text{Bandwidth (bits/sec)}} + \text{Jitter} $$
 
+*   **Jitter Component**: We inject a stochastic delay $\Delta_j \sim U(10ms, 50ms)$ to every packet.
+    *   *Justification*: In LTE/5G networks, scheduling grants, HARQ retransmissions, and core network queuing introduce irreducible delay variations typically in the range of 10-50ms (Source: 5G LLC Low Latency Reports).
+    
 *   **Impact of Image Size**:
     *   **RAW Image**: ~150 KB ($1.2 \times 10^6$ bits). At 10 Mbps, transmission takes **0.12s**. At 1 Mbps, it takes **1.2s** (exceeding the deadline).
     *   **Semantic Vector**: ~17 KB ($1.3 \times 10^5$ bits). At 1 Mbps, transmission takes **0.13s**.

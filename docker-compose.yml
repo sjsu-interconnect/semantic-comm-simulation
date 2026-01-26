@@ -12,6 +12,9 @@ services:
     environment:
       - DATASET_TYPE=CIFAR10 # Options: CIFAR10, STL10, CUSTOM
       - EXPERIMENT_STEPS=${EXPERIMENT_STEPS:-5000} # Number of steps to run the experiment (default 5000)
+    depends_on:
+      - edge-encoder
+      - edge-decoder
     # ... other sender config ...
 
   receiver:

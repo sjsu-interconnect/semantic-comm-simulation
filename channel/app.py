@@ -126,9 +126,15 @@ class DynamicChannel:
         bandwidth_mbps = self.current_bandwidth
         
         msg_len_megabits = (msg_len * 8) / 1_000_000
-        delay_sec = msg_len_megabits / bandwidth_mbps
+        transmission_delay = msg_len_megabits / bandwidth_mbps
         
-        logging.info(f"Received msg (Size: {msg_len} B). BW: {bandwidth_mbps:.2f} Mbps. Delaying for {delay_sec:.4f}s.")
+        # Add Jitter (Queuing Delay): 10ms to 50ms random noise
+        # Justification: LTE/5G scheduling and queuing typically introduces 10-50ms variance.
+        jitter = random.uniform(0.01, 0.05)
+        
+        delay_sec = transmission_delay + jitter
+        
+        logging.info(f"Received msg (Size: {msg_len} B). BW: {bandwidth_mbps:.2f} Mbps. Trans: {transmission_delay:.4f}s + Jitter: {jitter:.4f}s = Total: {delay_sec:.4f}s")
         time.sleep(delay_sec)
         
         # 2. Process the message payload

@@ -205,6 +205,13 @@ class SenderAgent:
         self.raw_count = 0
         self.semantic_edge_count = 0
 
+        # --- Baseline Mode Config ---
+        self.baseline_mode = os.environ.get('BASELINE', 'DRL').upper() # 'DRL', 'RAW', 'HEURISTIC'
+        if self.baseline_mode not in ['DRL', 'RAW', 'HEURISTIC']:
+             logging.warning(f"Unknown BASELINE mode '{self.baseline_mode}'. Defaulting to DRL.")
+             self.baseline_mode = 'DRL'
+        logging.info(f"Running in Mode: {self.baseline_mode}")
+
 
         # --- Initialize Feature Extractor (Encoder) ---
         logging.info("Initializing TinyVAE Encoder (Local/Fast)...")
@@ -563,12 +570,34 @@ class SenderAgent:
                 for step in range(1, self.total_steps + 1):
                     
                     # 1. AGENT: Select Action
-                    # Explicit Epsilon-Greedy Exploration
-                    if random.random() < self.epsilon:
-                        action = self.env.action_space.sample()
-                        # logging.info(f"Exploration: Random Action {action} selected.")
+                    
+                    if self.baseline_mode == 'RAW':
+                        # BASELINE: Always send RAW
+                        action = self.action_raw
+                        # logging.info("Baseline: Forcing RAW action.")
+                        
+                    elif self.baseline_mode == 'HEURISTIC':
+                        # BASELINE: Heuristic Rules
+                        # Use last_bandwidth (simulating observance)
+                        bw = self.last_bandwidth
+                        
+                        if bw < 2.0:
+                            action = self.action_semantic_local # Survival Mode
+                        elif bw < 8.0:
+                            action = self.action_semantic_edge # Quality Trade-off
+                        else:
+                            action = self.action_raw # High Quality
+                            
+                        # logging.info(f"Baseline Heuristic (BW={bw:.2f}): Selected {action}")
+
                     else:
-                        action, _ = self.model.predict(state, deterministic=False)
+                        # STANDARD DRL MODE
+                        # Explicit Epsilon-Greedy Exploration
+                        if random.random() < self.epsilon:
+                            action = self.env.action_space.sample()
+                            # logging.info(f"Exploration: Random Action {action} selected.")
+                        else:
+                            action, _ = self.model.predict(state, deterministic=False)
                     
                     # 2. SENDER: Create and send message
                     message_dict, log_msg_type = self._create_message_payload(action)
