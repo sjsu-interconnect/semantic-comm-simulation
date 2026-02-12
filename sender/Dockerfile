@@ -4,5 +4,4 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 # Copy the images into the container
-COPY ./images ./images
 CMD ["python", "-u", "app.py"]

@@ -68,9 +68,29 @@ The channel is configured to model a **Dynamic Wireless Edge Environment** (e.g.
 | **Channel Noise ($\sigma$)** | **0.0 - 0.5** | **Signal-to-Noise Ratio (SNR)** | Modeled as Additive White Gaussian Noise (AWGN). $\sigma=0.5$ corresponds to a low SNR environment (severe interference), common in industrial IoT or urban environments, affecting analog signal integrity. |
 | **Data Size Scale** | **1.0 - 20.0** | **Payload Variation** | Represents the fluctuation in payload size (e.g., Semantic Vector ~17KB vs RAW ~150KB). |
 
-#### 3.2.2 Dynamic Evolution
-The environment allows for continuous state evolution:
-*   **Update Interval**: 1.0s.
+#### 3.2.2 Dynamic Evolution (The State Transition Model)
+The network state does not jump randomly; it evolves as a **Bounded Random Walk** (Markov Process) to simulate the temporal coherence of real physical channels (e.g., walking through a shadow).
+
+The transition logic executed every $\Delta t = 1.0s$ is:
+
+**1. Bandwidth Evolution:**
+$$ B_{new} = \text{Clip}(B_{curr} + \delta_B, 1.0, 20.0) $$
+*   Where $\delta_B \sim \mathcal{U}(-5.0, 5.0)$ Mbps.
+*   *Explanation*: Bandwidth drifts by up to ±5 Mbps per second. This models fast fading or moving obstacles.
+
+**2. Noise Evolution:**
+$$ N_{new} = \text{Clip}(N_{curr} + \delta_N, 0.0, 0.5) $$
+*   Where $\delta_N \sim \mathcal{U}(-0.1, 0.1)$.
+*   *Explanation*: Noise changes more slowly, representing gradual environmental interference changes.
+
+**3. State Correlation:**
+Because $S_{t+1}$ depends heavily on $S_t$ (the "+ term"), the environment has **Memory**. If the channel is "Bad" now, it is likely to be "Bad" or "slightly less Bad" in the next second, but rarely "Perfect". The Agent must learn this temporal correlation to make optimal decisions.
+
+#### 3.2.3 Technical Implementation
+In the simulation code (`channel/app.py`), this logic is implemented using a **Background Thread** to ensure independence from the Sender's actions:
+1.  **Thread**: `DynamicChannel.update_channel_state()` runs in a separate `threading.Thread`.
+2.  **Concurrency**: It modifies the shared state variables (`self.current_bandwidth`, `self.current_noise`) every 1.0 seconds (`time.sleep(1)`).
+3.  **Interaction**: When the Sender transmits a packet, the main thread reads the *current* values of these variables. This mimics a real asynchronous environment where the weather doesn't wait for your packet transmission.
 
 ### 3.3 Training
 *   **Algorithm**: Deep Q-Network (DQN) with Experience Replay.

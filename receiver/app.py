@@ -42,7 +42,8 @@ SIM_DEC_SEMANTIC = 0.050
 SIM_DEC_RAW = 0.010
 
 EDGE_QUALITY_MULTIPLIER = 0.25 # Edge model is significantly better (75% less loss)
-RAW_NOISE_SENSITIVITY = 10.0 # RAW is very sensitive to noise (simulating packet corruption)
+EDGE_QUALITY_MULTIPLIER = 0.25 # Edge model is significantly better (75% less loss)
+# RAW_NOISE_SENSITIVITY removed. We now apply real noise to pixels/latents.
 
 
 class Receiver:
@@ -341,9 +342,20 @@ class Receiver:
                 gt_img_pil = Image.open(io.BytesIO(gt_image_bytes)).convert('RGB')
                 gt_image = self.preprocess(gt_img_pil) # [C, H, W] tensor
 
+            # --- Apply Noise to Received Data ---
+            if observed_noise > 0.0:
+                 if msg_type == "RAW":
+                     # For RAW, payload is the image bytes. We decode first, then add noise to pixels.
+                     pass # Processed inside the block below
+                 elif msg_type in ["SEM_LOCAL", "SEM_EDGE"]:
+                     # For Semantic, payload is the vector. Add noise to latent space.
+                     logging.info(f"Applying Semantic Noise (sigma={observed_noise:.3f}) to latents")
+                     noise = np.random.normal(0, observed_noise, payload.shape).astype(payload.dtype)
+                     payload = payload + noise
+
             if msg_type == "SEM_LOCAL":
                 log_msg_type = "SEM_LOCAL"
-                # Payload is the noisy vector
+                # Payload is the (now potentially noisy) vector
                 noisy_vector = payload 
                 logging.info("Running Local Decoder...")
                 reconstructed_image = self._decode_vector(noisy_vector)
@@ -353,7 +365,7 @@ class Receiver:
 
             elif msg_type == "SEM_EDGE":
                 log_msg_type = "SEM_EDGE"
-                # Payload is the noisy vector
+                # Payload is the (now potentially noisy) vector
                 noisy_vector = payload 
                 logging.info("Running Edge Decoder...")
                 reconstructed_image = self._decode_edge_vector(noisy_vector)
@@ -369,17 +381,24 @@ class Receiver:
                 sim_dec_time = SIM_DEC_SEMANTIC
                 
                 # Apply Quality Multiplier (simulate better model)
-                # We apply it to the final loss calculation later, or modify here?
-                # Let's flag it.
                 is_edge_quality = True
 
             elif msg_type == "RAW":
                 log_msg_type = "RAW"
-                # Payload is the raw image bytes (same as GT in this case)
+                # Payload is the raw image bytes
                 img_stream = io.BytesIO(payload)
                 img = Image.open(img_stream).convert('RGB')
                 logging.info("Processing RAW image...")
                 reconstructed_image = self.preprocess(img)
+                
+                # Apply Noise to RAW Pixels
+                if observed_noise > 0.0:
+                    logging.info(f"Applying RAW Noise (sigma={observed_noise:.3f}) to pixels")
+                    # Image is [3, 256, 256] -> Add noise
+                    noise = torch.randn_like(reconstructed_image) * observed_noise
+                    reconstructed_image = reconstructed_image + noise
+                    # Clip to [0,1]
+                    reconstructed_image = torch.clamp(reconstructed_image, 0.0, 1.0)
                 
                 sim_enc_time = SIM_ENC_RAW
                 sim_dec_time = SIM_DEC_RAW
@@ -410,12 +429,8 @@ class Receiver:
         if is_edge_quality:
             reconstruction_loss *= EDGE_QUALITY_MULTIPLIER
             
-        # 2. RAW Noise Penalty (Simulate Corruption)
-        if msg_type == "RAW" and observed_noise > 0:
-            # Simulate massive corruption proportional to noise
-            raw_corruption = RAW_NOISE_SENSITIVITY * (observed_noise ** 2)
-            reconstruction_loss += raw_corruption
-            logging.info(f"  -> Applied RAW Noise Penalty: +{raw_corruption:.4f} MSE")
+        # 2. RAW Noise Penalty logic REMOVED. 
+        # Loss is now naturally higher if noise was added to pixels above.
 
         reward = self._calculate_reward(reconstruction_loss, total_latency)
 

@@ -3,7 +3,6 @@ services:
     build: ./sender
     volumes:
       - ./sender:/app # Mount source code
-      - ./images:/app/images:ro
       - ./runs:/app/runs
       - ./models:/app/models
       - ./sender/utils:/app/utils:ro # Mount utils to ensure it's available and up-to-date
@@ -12,6 +11,8 @@ services:
     environment:
       - DATASET_TYPE=CIFAR10 # Options: CIFAR10, STL10, CUSTOM
       - EXPERIMENT_STEPS=${EXPERIMENT_STEPS:-5000} # Number of steps to run the experiment (default 5000)
+      - BASELINE=${BASELINE:-DRL} # Baseline mode: DRL, RAW, HEURISTIC
+      - LOAD_MODEL=${LOAD_MODEL} # Optional: Model to load
     depends_on:
       - edge-encoder
       - edge-decoder
@@ -20,7 +21,6 @@ services:
   receiver:
     build: ./receiver
     volumes:
-      - ./images:/app/images:ro
       - ./runs:/app/runs
       - ./models:/app/models
       - ./sender/utils:/app/utils:ro # Share utils from sender

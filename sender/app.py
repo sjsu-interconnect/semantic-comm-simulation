@@ -647,7 +647,12 @@ class SenderAgent:
                     next_state = self._get_normalized_state(next_local_state, noise, bandwidth)
                     
                     # Add experience to replay buffer
-                    self.model.replay_buffer.add(state, next_state, action, reward, done=False, infos=[{}])
+                    # Ensure action/reward/done are arrays for SB3 ReplayBuffer
+                    action_arr = np.array([action])
+                    reward_arr = np.array([reward], dtype=np.float32)
+                    done_arr = np.array([False])
+                    
+                    self.model.replay_buffer.add(state, next_state, action_arr, reward_arr, done_arr, infos=[{}])
                     
                     # Update state for next loop
                     state = next_state
