@@ -8,6 +8,57 @@ The core is a **DQN Agent** (Sender) that learns to balance **Visual Quality** a
 
 ## System Architecture
 
+```mermaid
+graph TD
+    subgraph Sender_Node [IoT Device / Sender]
+        style Sender_Node fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+        Sender_Agent[DQN Agent]
+        TinyVAE["TinyVAE Encoder (Local)"]
+        
+        Sender_Agent -- Selects Action --> Action_Decision{"Action?"}
+        Action_Decision -- "SEM_LOCAL (0)" --> TinyVAE
+        Action_Decision -- "SEM_EDGE (2)" --> Edge_Client[HTTP Client]
+        Action_Decision -- "RAW (1)" --> Raw_Packager[Raw Packager]
+        
+        TinyVAE -- Latent Vector --> Msg_Packager[Message Packager]
+        Edge_Client -- "Image (HTTP)" --> Edge_Service_Enc
+        Raw_Packager -- JPEG Bytes --> Msg_Packager
+    end
+
+    subgraph Edge_Node [Edge Server]
+        style Edge_Node fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
+        Edge_Service_Enc["Edge Encoder (Stable Diffusion VAE)"]
+        Edge_Service_Dec["Edge Decoder (Stable Diffusion VAE)"]
+        
+        Edge_Service_Enc -- "Latent Vector" --> Edge_Client
+    end
+
+    subgraph Channel_Sim [Dynamic Channel]
+        style Channel_Sim fill:#fff3e0,stroke:#e65100,stroke-width:2px
+        Channel_Logic[Dynamic Channel Logic]
+        
+        Msg_Packager == "Message" ==> Channel_Logic
+        Channel_Logic -- "Adds Noise & Latency" --> Receiver_In
+    end
+
+    subgraph Receiver_Node [Receiver / Cloud]
+        style Receiver_Node fill:#e8f5e9,stroke:#1b5e20,stroke-width:2px
+        Receiver_In[Receiver Input]
+        TinyDecoder[TinyVAE Decoder]
+        
+        Receiver_In -- "Local Vector" --> TinyDecoder
+        Receiver_In -- "Edge Vector" --> Edge_Service_Dec
+        Receiver_In -- "Raw" --> Feature_Ext[Image Processor]
+        
+        TinyDecoder -- "Reconstructed Img" --> Reward_Calc[Reward Calculator]
+        Edge_Service_Dec -- "Reconstructed Img" --> Reward_Calc
+        Feature_Ext -- "Ground Truth" --> Reward_Calc
+    end
+
+    %% Feedback Flow
+    Reward_Calc -- "Reward + Net State" --> Sender_Agent
+```
+
 The simulation mimics a modern IoT-to-Edge pipeline with three distinct tiers of data processing.
 
 ### Key Components
