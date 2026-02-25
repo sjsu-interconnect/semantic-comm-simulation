@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Usage: ./run_baseline.sh [RAW|HEURISTIC|DRL]
+# Usage: ./run_baseline.sh [RAW|HEURISTIC|DRL|SEM_EDGE]
 
 MODE=${1:-DRL} # Default to DRL if not specified
 

@@ -206,8 +206,8 @@ class SenderAgent:
         self.semantic_edge_count = 0
 
         # --- Baseline Mode Config ---
-        self.baseline_mode = os.environ.get('BASELINE', 'DRL').upper() # 'DRL', 'RAW', 'HEURISTIC'
-        if self.baseline_mode not in ['DRL', 'RAW', 'HEURISTIC']:
+        self.baseline_mode = os.environ.get('BASELINE', 'DRL').upper() # 'DRL', 'RAW', 'HEURISTIC', 'SEM_EDGE'
+        if self.baseline_mode not in ['DRL', 'RAW', 'HEURISTIC', 'SEM_EDGE']:
              logging.warning(f"Unknown BASELINE mode '{self.baseline_mode}'. Defaulting to DRL.")
              self.baseline_mode = 'DRL'
         logging.info(f"Running in Mode: {self.baseline_mode}")
@@ -585,6 +585,11 @@ class SenderAgent:
                         # BASELINE: Always send RAW
                         action = self.action_raw
                         # logging.info("Baseline: Forcing RAW action.")
+                        
+                    elif self.baseline_mode == 'SEM_EDGE':
+                        # BASELINE: Always send SEM_EDGE
+                        action = self.action_semantic_edge
+                        # logging.info("Baseline: Forcing SEM_EDGE action.")
                         
                     elif self.baseline_mode == 'HEURISTIC':
                         # BASELINE: Heuristic Rules
