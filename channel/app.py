@@ -54,15 +54,43 @@ class DynamicChannel:
         """
         Periodically updates the channel's noise and bandwidth in a separate thread.
         Uses a simple random walk, bounded by np.clip.
+        Also configures the Docker container's eth0 interface using `tc` to simulate bandwidth and jitter.
         """
+        import subprocess
+
         logging.info("Dynamic state update thread started.")
+        
+        # Initialize tc qdisc (clear any existing, then add root tbf)
+        try:
+            subprocess.run(["tc", "qdisc", "del", "dev", "eth0", "root"], check=False, stderr=subprocess.DEVNULL)
+            # Add a basic Token Bucket Filter just to get started. We'll replace it in the loop.
+            subprocess.run(["tc", "qdisc", "add", "dev", "eth0", "root", "handle", "1:", "tbf", "rate", f"{self.current_bandwidth}mbit", "burst", "32kbit", "latency", "400ms"], check=True)
+            # Add NetEm under the TBF to simulate the jitter
+            subprocess.run(["tc", "qdisc", "add", "dev", "eth0", "parent", "1:1", "handle", "10:", "netem", "delay", "30ms", "20ms"], check=True)
+        except Exception as e:
+            logging.error(f"Failed to initialize tc: {e} (Are you missing NET_ADMIN capability?)")
+
         while True:
+            # Random walk for Noise
             noise_change = random.uniform(-0.1, 0.1)
             self.current_noise = np.clip(self.current_noise + noise_change, 0.0, 0.5)
             
+            # Random walk for Bandwidth
             bw_change = random.uniform(-5.0, 5.0)
             self.current_bandwidth = np.clip(self.current_bandwidth + bw_change, 1.0, 20.0)
             
+            # Jitter variation
+            base_delay_ms = int(random.uniform(10, 50))
+            jitter_ms = int(random.uniform(5, base_delay_ms/2))
+
+            try:
+                # Update TBF (Bandwidth)
+                subprocess.run(["tc", "qdisc", "change", "dev", "eth0", "root", "handle", "1:", "tbf", "rate", f"{self.current_bandwidth:.2f}mbit", "burst", "32kbit", "latency", "400ms"], check=True)
+                # Update NetEm (Jitter)
+                subprocess.run(["tc", "qdisc", "change", "dev", "eth0", "parent", "1:1", "handle", "10:", "netem", "delay", f"{base_delay_ms}ms", f"{jitter_ms}ms"], check=True)
+            except Exception as e:
+                logging.error(f"Failed to dynamically update tc: {e}")
+
             time.sleep(1) # Update state every 1 second
 
     def add_noise(self, vector: np.ndarray) -> np.ndarray:
@@ -70,12 +98,6 @@ class DynamicChannel:
         Applies Gaussian noise to a numpy vector based on the current noise level.
         """
         try:
-            # Removed strict size check to allow for different vector sizes (512 vs 4x32x32)
-            # if vector.shape[0] != self.vector_size:
-            #    logging.warning(f"Noise] Error: Expected vector size {self.vector_size}, got {vector.shape[0]}")
-            #    return vector
-
-            
             noise = np.random.normal(0, self.current_noise, vector.shape)
             noisy_vector = vector + noise
             return noisy_vector
@@ -117,25 +139,15 @@ class DynamicChannel:
 
     def process_and_simulate(self, pickled_payload: bytes) -> Optional[bytes]:
         """
-        Simulates network delay and applies noise to the message.
+        Applies noise to the message. Network latency (bandwidth/jitter) is now handled natively
+        by Docker Linux Traffic Control (tc).
         Returns the final message to be forwarded.
         """
-        # 1. Simulate network latency (delay)
         msg_len = len(pickled_payload)
         noise_level = self.current_noise
         bandwidth_mbps = self.current_bandwidth
         
-        msg_len_megabits = (msg_len * 8) / 1_000_000
-        transmission_delay = msg_len_megabits / bandwidth_mbps
-        
-        # Add Jitter (Queuing Delay): 10ms to 50ms random noise
-        # Justification: LTE/5G scheduling and queuing typically introduces 10-50ms variance.
-        jitter = random.uniform(0.01, 0.05)
-        
-        delay_sec = transmission_delay + jitter
-        
-        logging.info(f"Received msg (Size: {msg_len} B). BW: {bandwidth_mbps:.2f} Mbps. Trans: {transmission_delay:.4f}s + Jitter: {jitter:.4f}s = Total: {delay_sec:.4f}s")
-        time.sleep(delay_sec)
+        logging.info(f"Received msg (Size: {msg_len} B). TC is enforcing BW: {bandwidth_mbps:.2f} Mbps natively.")
         
         # 2. Process the message payload
         try:

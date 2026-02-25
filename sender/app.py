@@ -469,7 +469,10 @@ class SenderAgent:
             self.semantic_local_count += 1
             message_dict['type'] = 'SEM_LOCAL'
             # Send the semantic vector (compressed)
+            start_encode = time.time()
             vector = self._get_image_feature_vector(img)
+            encode_time = time.time() - start_encode
+            message_dict['encode_time'] = encode_time
             message_dict['payload'] = vector
             log_msg_type = "SEM_LOCAL"
 
@@ -477,13 +480,17 @@ class SenderAgent:
             self.semantic_edge_count += 1
             message_dict['type'] = 'SEM_EDGE'
             # Send the semantic vector from Edge service
+            # We assume edge GPU is unconstrained and ultra-fast
             vector = self._get_edge_feature_vector(img)
+            message_dict['encode_time'] = 0.010
             message_dict['payload'] = vector
             log_msg_type = "SEM_EDGE"
             
         else:  # ACTION_RAW
             self.raw_count += 1
             message_dict['type'] = 'RAW'
+            
+            start_encode = time.time()
             # Convert PIL image to bytes
             img_byte_arr = io.BytesIO()
             img.save(img_byte_arr, format='JPEG')
@@ -494,7 +501,10 @@ class SenderAgent:
             padding_size = 150 * 1024 # 150 KB
             dummy_padding = b'\x00' * padding_size
             
-            message_dict['payload'] = img_byte_arr.getvalue() + dummy_padding
+            payload_bytes = img_byte_arr.getvalue() + dummy_padding
+            encode_time = time.time() - start_encode
+            message_dict['encode_time'] = encode_time
+            message_dict['payload'] = payload_bytes
             log_msg_type = f"RAW (+{padding_size//1024}KB Pad)"
             
         # --- Update Timestamp JUST BEFORE RETURN --- 

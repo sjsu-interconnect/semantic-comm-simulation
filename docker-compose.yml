@@ -16,6 +16,10 @@ services:
     depends_on:
       - edge-encoder
       - edge-decoder
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
     # ... other sender config ...
 
   receiver:
@@ -35,6 +39,8 @@ services:
     build: ./channel
     ports:
       - "65431:65431"
+    cap_add:
+      - NET_ADMIN
     depends_on:
       - sender
     # ... other channel config ..

@@ -34,6 +34,7 @@ DEFAULT_ALPHA_WEIGHT = 20.0
 DEFAULT_LATENCY_PENALTY_FACTOR = 5.0  # Increased to punish latency more severely
 
 # --- SIMULATED TIMES (Seconds) ---
+# Values are now empirically measured via time.time() timestamps
 SIM_ENC_SEMANTIC_LOCAL = 0.800 # Very Slow Mobile CPU (Almost deadline) 
 SIM_ENC_SEMANTIC_EDGE = 0.010  # Fast Edge GPU cluster
 SIM_ENC_RAW = 0.005
@@ -280,8 +281,9 @@ class Receiver:
         observed_bandwidth = -1.0
         
         # For latency calc
-        sim_enc_time = 0.0
+        encode_time = 0.0
         sim_dec_time = 0.0
+        edge_upload_delay = 0.0
         is_edge_quality = False
 
         try:
@@ -303,6 +305,7 @@ class Receiver:
             original_label = message_dict['label']
             msg_type = message_dict['type']
             payload = message_dict['payload']
+            encode_time = message_dict.get('encode_time', 0.0)
 
             # --- SNR Calculation ---
             snr_db = -1.0 # Default if not applicable
@@ -358,27 +361,30 @@ class Receiver:
                 # Payload is the (now potentially noisy) vector
                 noisy_vector = payload 
                 logging.info("Running Local Decoder...")
-                reconstructed_image = self._decode_vector(noisy_vector)
                 
-                sim_enc_time = SIM_ENC_SEMANTIC_LOCAL
-                sim_dec_time = SIM_DEC_SEMANTIC
+                start_decode = time.time()
+                reconstructed_image = self._decode_vector(noisy_vector)
+                sim_dec_time = time.time() - start_decode
 
             elif msg_type == "SEM_EDGE":
                 log_msg_type = "SEM_EDGE"
                 # Payload is the (now potentially noisy) vector
                 noisy_vector = payload 
                 logging.info("Running Edge Decoder...")
+                
+                start_decode = time.time()
                 reconstructed_image = self._decode_edge_vector(noisy_vector)
+                sim_dec_time = time.time() - start_decode
                 
-                # Edge Latency = Fast Compute + Upload Lag
-                # Simulate 50KB upload to Edge
+                # Dynamic Edge Latency = Upload Time + Distance Prop
+                # Simulate 50KB upload to Edge using 10x the primary channel bandwidth
                 edge_upload_size_bits = 50 * 1024 * 8 
-                # Avoid div by zero
-                current_bw_bps = max(1.0, observed_bandwidth) * 1_000_000
-                edge_upload_delay = edge_upload_size_bits / current_bw_bps
+                # Avoid div by zero, apply 10x multiplier
+                edge_bandwidth_bps = max(1.0, observed_bandwidth * 10.0) * 1_000_000
+                calc_upload_delay = edge_upload_size_bits / edge_bandwidth_bps
+                base_prop_delay = np.random.uniform(0.010, 0.050)
                 
-                sim_enc_time = SIM_ENC_SEMANTIC_EDGE + edge_upload_delay
-                sim_dec_time = SIM_DEC_SEMANTIC
+                edge_upload_delay = calc_upload_delay + base_prop_delay
                 
                 # Apply Quality Multiplier (simulate better model)
                 is_edge_quality = True
@@ -389,7 +395,10 @@ class Receiver:
                 img_stream = io.BytesIO(payload)
                 img = Image.open(img_stream).convert('RGB')
                 logging.info("Processing RAW image...")
+                
+                start_decode = time.time()
                 reconstructed_image = self.preprocess(img)
+                sim_dec_time = time.time() - start_decode
                 
                 # Apply Noise to RAW Pixels
                 if observed_noise > 0.0:
@@ -399,9 +408,6 @@ class Receiver:
                     reconstructed_image = reconstructed_image + noise
                     # Clip to [0,1]
                     reconstructed_image = torch.clamp(reconstructed_image, 0.0, 1.0)
-                
-                sim_enc_time = SIM_ENC_RAW
-                sim_dec_time = SIM_DEC_RAW
 
             else:
                 logging.warning(f"Error: Unknown message type '{msg_type}'. Skipping.")
@@ -418,8 +424,8 @@ class Receiver:
         # Network Latency
         network_latency = reception_timestamp - send_timestamp
         
-        # Total Latency = Network + Sim Enc + Sim Dec
-        total_latency = network_latency + sim_enc_time + sim_dec_time
+        # Total Latency = Network + Sim Enc + Sim Dec + Edge Upload
+        total_latency = network_latency + encode_time + sim_dec_time + edge_upload_delay
 
         # Calculate Reconstruction Loss (MSE)
         reconstruction_loss = self._calculate_reconstruction_loss(gt_image, reconstructed_image)
