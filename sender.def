@@ -1,0 +1,15 @@
+Bootstrap: docker
+From: python:3.9-slim
+
+%files
+    sender/requirements.txt /app/requirements.txt
+
+%post
+    pip install --no-cache-dir -r /app/requirements.txt
+
+%environment
+    export PYTHONPATH=/app
+
+%runscript
+    cd /app
+    exec python -u app.py

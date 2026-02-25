@@ -1,0 +1,16 @@
+Bootstrap: docker
+From: python:3.9-slim
+
+%files
+    channel/requirements.txt /app/requirements.txt
+
+%post
+    apt-get update && apt-get install -y iproute2
+    pip install --no-cache-dir -r /app/requirements.txt
+
+%environment
+    export PYTHONPATH=/app
+
+%runscript
+    cd /app
+    exec python -u app.py

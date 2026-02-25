@@ -124,7 +124,7 @@ git clone https://github.com/SaiPrakash2k/semantic-comm-simulation.git
 cd semantic-comm-simulation
 ```
 
-### 3. Start the Simulation
+### 3. Start the Simulation (Docker)
 Run the following command to build the Docker containers and start the environment:
 
 ```bash
@@ -133,6 +133,19 @@ docker-compose up --build
 > **Note**: The first run will be slow (5-10 mins) as it downloads:
 > 1.  PyTorch Docker images.
 > 2.  Pretrained models from Hugging Face (`madebyollin/taesd` and `CompVis/stable-diffusion-v1-4`).
+
+### 3b. Start the Simulation (Apptainer / HPC)
+If you are on a lab server or HPC system that does not support Docker, you can use the included Apptainer setup:
+
+1. **Build the images** (Requires `--fakeroot` or admin privileges depending on your system):
+    ```bash
+    ./build_apptainer.sh
+    ```
+2. **Run the simulation**:
+    ```bash
+    ./run_apptainer.sh
+    ```
+*(Note: Because the `channel` uses Linux `tc` to simulate bandwidth, the run script utilizes the `--net` flag to keep network modifications isolated from the host machine).*
 
 ### 4. Monitoring the Experiment
 Once the simulation is running:
