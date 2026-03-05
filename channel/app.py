@@ -75,9 +75,9 @@ class DynamicChannel:
             noise_change = random.uniform(-0.1, 0.1)
             self.current_noise = np.clip(self.current_noise + noise_change, 0.0, 0.5)
             
-            # Random walk for Bandwidth
-            bw_change = random.uniform(-5.0, 5.0)
-            self.current_bandwidth = np.clip(self.current_bandwidth + bw_change, 1.0, 20.0)
+            # Random walk for Bandwidth (allow up to 150 Mbps for RAW sending)
+            bw_change = random.uniform(-15.0, 15.0)
+            self.current_bandwidth = np.clip(self.current_bandwidth + bw_change, 1.0, 150.0)
             
             # Jitter variation
             base_delay_ms = int(random.uniform(10, 50))

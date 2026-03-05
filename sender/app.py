@@ -61,7 +61,7 @@ ACTION_SEMANTIC_EDGE = 2
 # Data Size High = 4096 * 4 bytes / 1024 = 16 KB.
 # Let's adjust state space high for data size to 20KB.
 STATE_SPACE_LOW = np.array([0.0, 0.0, 1.0, 0.0, 1.0], dtype=np.float32)
-STATE_SPACE_HIGH = np.array([100.0, 100.0, 20.0, 0.5, 20.0], dtype=np.float32)
+STATE_SPACE_HIGH = np.array([100.0, 100.0, 20.0, 0.5, 150.0], dtype=np.float32)
 
 
 
@@ -534,8 +534,20 @@ class SenderAgent:
         """
         Connects to the channel and runs the main DRL training loop.
         """
-        logging.info("Waiting 10s for other services to start...")
+        logging.info("Waiting 10s for base services to start...")
         time.sleep(10)
+        
+        if self.baseline_mode in ['SEM_EDGE', 'DRL', 'HEURISTIC']:
+            logging.info("Waiting for Edge Encoder to be ready...")
+            for _ in range(60):
+                try:
+                    res = requests.get("http://edge-encoder:8000/docs")
+                    if res.status_code == 200:
+                        logging.info("Edge Encoder is ready.")
+                        break
+                except requests.exceptions.ConnectionError:
+                    pass
+                time.sleep(2)
         
         # Initialize the 5D state
         local_state = self._get_local_state()

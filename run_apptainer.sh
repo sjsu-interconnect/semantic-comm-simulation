@@ -5,6 +5,9 @@ MODE=${1:-DRL} # Default to DRL if not specified
 export BASELINE=$MODE
 export EXPERIMENT_STEPS=${EXPERIMENT_STEPS:-5000}
 
+# Apptainer requires host directories to exist before bind mounting them
+mkdir -p ./runs ./models
+
 echo "Starting Simulation in BASELINE MODE: $BASELINE"
 
 echo "Starting Edge Services..."

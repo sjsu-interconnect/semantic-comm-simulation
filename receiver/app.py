@@ -374,17 +374,23 @@ class Receiver:
                 
                 start_decode = time.time()
                 reconstructed_image = self._decode_edge_vector(noisy_vector)
-                sim_dec_time = time.time() - start_decode
+                # sim_dec_time = time.time() - start_decode
                 
-                # Dynamic Edge Latency = Upload Time + Distance Prop
-                # Simulate 50KB upload to Edge using 10x the primary channel bandwidth
+                # --- SIMULATION OVERRIDE ---
+                # We assume the Edge Decoder runs on a powerful GPU and takes ~10ms
+                sim_dec_time = 0.010
+                
+                # Dynamic Edge Latency = Upload Time + Distance Prop + Congestion Penalty
+                # In poor connectivity conditions (< 5 Mbps), edge servers become hard to reach
+                edge_access_penalty = 5.0 / max(0.5, observed_bandwidth)
+                
+                # Simulate 50KB upload to Edge (using realistic bandwidth correlation)
                 edge_upload_size_bits = 50 * 1024 * 8 
-                # Avoid div by zero, apply 10x multiplier
-                edge_bandwidth_bps = max(1.0, observed_bandwidth * 10.0) * 1_000_000
+                edge_bandwidth_bps = max(1.0, observed_bandwidth) * 1_000_000
                 calc_upload_delay = edge_upload_size_bits / edge_bandwidth_bps
                 base_prop_delay = np.random.uniform(0.010, 0.050)
                 
-                edge_upload_delay = calc_upload_delay + base_prop_delay
+                edge_upload_delay = calc_upload_delay + base_prop_delay + edge_access_penalty
                 
                 # Apply Quality Multiplier (simulate better model)
                 is_edge_quality = True
@@ -421,8 +427,15 @@ class Receiver:
         logging.info("Calculating performance...")
         # reception_timestamp is passed in now to capture network arrival time
         
-        # Network Latency
-        network_latency = reception_timestamp - send_timestamp
+        # Simulated Network Latency
+        # Time = (Data Size in Bits) / (Bandwidth in Bits per second)
+        payload_size_bits = len(data) * 8
+        network_bandwidth_bps = max(1.0, observed_bandwidth) * 1_000_000
+        
+        # Add a realistic base propagation delay (e.g., 20ms)
+        base_prop_delay = 0.020
+        
+        network_latency = (payload_size_bits / network_bandwidth_bps) + base_prop_delay
         
         # Total Latency = Network + Sim Enc + Sim Dec + Edge Upload
         total_latency = network_latency + encode_time + sim_dec_time + edge_upload_delay
@@ -451,6 +464,19 @@ class Receiver:
         self.writer.add_scalar("Performance/Reward", reward, self.step_counter)
         self.writer.add_scalar("Network/Noise", observed_noise, self.step_counter)
         self.writer.add_scalar("Network/Bandwidth", observed_bandwidth, self.step_counter)
+        
+        # Log Edge Penalty only if applicable
+        if is_edge_quality:
+             try:
+                 # Recalculate just for logging (or we could pass it down, but recalculating is fine)
+                 edge_access_penalty = 5.0 / max(0.5, observed_bandwidth)
+                 self.writer.add_scalar("Network/EdgeAccessPenalty", edge_access_penalty, self.step_counter)
+                 edge_log_str = f" [Edge Penalty (Poor BW): {edge_access_penalty:.3f}s]"
+             except:
+                 edge_log_str = ""
+        else:
+             edge_log_str = ""
+
         if snr_db > -1.0:
              self.writer.add_scalar("Network/SNR_dB", snr_db, self.step_counter)
             
@@ -460,8 +486,8 @@ class Receiver:
             if gt_image is not None:
                 self.writer.add_image("Images/GroundTruth", gt_image, self.step_counter)
 
-        logging.info(f"Received {log_msg_type} for: {original_label}")
-        logging.info(f"Latency Breakdown: Net={network_latency:.4f}s, SimEnc={sim_enc_time}s, Total={total_latency:.4f}s")
+        logging.info(f"Receiving {msg_type} (Size: {len(data)})")
+        logging.info(f"Latency Breakdown: Net={network_latency:.4f}s, SimEnc={encode_time:.4f}s, Total={total_latency:.4f}s{edge_log_str}")
         logging.info(f"Reconstruction Loss (MSE): {reconstruction_loss:.4f}")
         logging.info(f"Network State: (Noise: {observed_noise:.3f}, BW: {observed_bandwidth:.2f})")
         logging.info(f"Calculated Reward: {reward:.4f}")
